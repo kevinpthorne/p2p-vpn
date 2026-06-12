@@ -165,8 +165,9 @@ func (r *RealTun) DeleteRoute(subnetCIDR string) error {
 
 // MockTun acts as a dry-run mock TUN interface
 type MockTun struct {
-	name   string
-	readCh chan []byte
+	name    string
+	readCh  chan []byte
+	OnWrite func([]byte)
 }
 
 func NewMockTun(name string) TunInterface {
@@ -199,6 +200,9 @@ func (m *MockTun) Write(p []byte) (n int, err error) {
 	if len(p) > 28 && p[9] == 17 { // IPv4 protocol 17 = UDP
 		payload := p[28:]
 		fmt.Printf("   💬 UDP Payload (Decrypted): %s\n", string(payload))
+	}
+	if m.OnWrite != nil {
+		m.OnWrite(p)
 	}
 	return len(p), nil
 }

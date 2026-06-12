@@ -19,6 +19,8 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/control"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -28,6 +30,51 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// WhitelistConnectionGater filters incoming and outgoing connections based on a peer ID whitelist
+type WhitelistConnectionGater struct {
+	allowedPeers map[peer.ID]bool
+	mu           sync.RWMutex
+}
+
+var _ connmgr.ConnectionGater = (*WhitelistConnectionGater)(nil)
+
+func NewWhitelistConnectionGater(allowed []peer.ID) *WhitelistConnectionGater {
+	m := make(map[peer.ID]bool)
+	for _, p := range allowed {
+		m[p] = true
+	}
+	return &WhitelistConnectionGater{
+		allowedPeers: m,
+	}
+}
+
+func (g *WhitelistConnectionGater) InterceptPeerDial(p peer.ID) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.allowedPeers[p]
+}
+
+func (g *WhitelistConnectionGater) InterceptAddrDial(p peer.ID, addr multiaddr.Multiaddr) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.allowedPeers[p]
+}
+
+func (g *WhitelistConnectionGater) InterceptAccept(c network.ConnMultiaddrs) bool {
+	return true
+}
+
+func (g *WhitelistConnectionGater) InterceptSecured(dir network.Direction, p peer.ID, c network.ConnMultiaddrs) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.allowedPeers[p]
+}
+
+func (g *WhitelistConnectionGater) InterceptUpgraded(c network.Conn) (bool, control.DisconnectReason) {
+	return true, 0
+}
+
 
 // Configuration Constants
 const (
@@ -355,8 +402,7 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 	return buf, nil
 }
 
-// Host Factory & Identity Functions (Adapted from p2p-tunnel)
-func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string) (host.Host, *dht.IpfsDHT, error) {
+func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 	udpListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 
@@ -395,26 +441,37 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		)
 	}
 
-	// Private network swarm key
-	pskFile, err := os.Open(pskPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not open swarm.key: %w", err)
+	if len(allowedPeers) > 0 {
+		gater := NewWhitelistConnectionGater(allowedPeers)
+		opts = append(opts, libp2p.ConnectionGater(gater))
+		log.Printf("🔒 Connection Gater enabled with %d allowed peers", len(allowedPeers))
 	}
-	defer pskFile.Close()
 
-	pskBytes, err := io.ReadAll(pskFile)
-	if err != nil {
-		return nil, nil, err
-	}
-	pskFile.Seek(0, 0)
-	hash := sha256.Sum256(pskBytes)
-	log.Printf("🔑 Swarm Key Fingerprint: %x", hash)
+	if pskPath != "" {
+		if _, err := os.Stat(pskPath); err == nil {
+			// Private network swarm key
+			pskFile, err := os.Open(pskPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not open swarm.key: %w", err)
+			}
+			defer pskFile.Close()
 
-	psk, err := pnet.DecodeV1PSK(pskFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid swarm.key format: %w", err)
+			pskBytes, err := io.ReadAll(pskFile)
+			if err != nil {
+				return nil, nil, err
+			}
+			pskFile.Seek(0, 0)
+			hash := sha256.Sum256(pskBytes)
+			log.Printf("🔑 Swarm Key Fingerprint: %x", hash)
+
+			psk, err := pnet.DecodeV1PSK(pskFile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid swarm.key format: %w", err)
+			}
+			opts = append(opts, libp2p.PrivateNetwork(psk))
+			log.Println("🔑 Swarm Key (pnet) protection enabled (TCP-only mode enforced)")
+		}
 	}
-	opts = append(opts, libp2p.PrivateNetwork(psk))
 
 	h, err := libp2p.New(opts...)
 	if err != nil {

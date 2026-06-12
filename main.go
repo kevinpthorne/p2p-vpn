@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func getEnv(key, defaultValue string) string {
@@ -48,6 +50,7 @@ func main() {
 	tunIPFlag := flag.String("tun-ip", getEnv("P2P_VPN_TUN_IP", ""), "Virtual TUN interface IP/CIDR (e.g. 10.200.0.1/24)")
 	advertiseFlag := flag.String("advertise", getEnv("P2P_VPN_ADVERTISE", ""), "Comma-separated subnets to advertise (e.g. 10.100.1.0/24)")
 	dryRunFlag := flag.Bool("dry-run", getEnvBool("P2P_VPN_DRY_RUN", false), "Run with dry-run/mock TUN interface")
+	allowedPeersFlag := flag.String("allowed-peers", getEnv("P2P_VPN_ALLOWED_PEERS", ""), "Path to file containing allowed Peer IDs (one per line) for Connection Gater")
 	flag.Parse()
 
 	// Parse PORT env fallback if flag was 0
@@ -145,7 +148,62 @@ func main() {
 		relayAddrs = strings.Split(*relayAddrsFlag, ",")
 	}
 
-	h, dhtObj, err := makeHost(ctx, *secretKeyPathFlag, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag)
+	// Parse allowed peers list if specified
+	var allowedPeers []peer.ID
+	if *allowedPeersFlag != "" {
+		file, err := os.Open(*allowedPeersFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to open allowed-peers file: %v", err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			pid, err := peer.Decode(line)
+			if err != nil {
+				log.Fatalf("❌ FATAL: Invalid Peer ID in allowed-peers file %q: %v", line, err)
+			}
+			allowedPeers = append(allowedPeers, pid)
+		}
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("❌ FATAL: Error reading allowed-peers file: %v", err)
+		}
+		log.Printf("🔒 Loaded %d allowed Peer IDs from whitelist file", len(allowedPeers))
+
+		// Automatically append relay Peer IDs so we can connect to them
+		if *relayAddrsFlag != "" {
+			for _, rAddr := range strings.Split(*relayAddrsFlag, ",") {
+				trimmed := strings.TrimSpace(rAddr)
+				if trimmed == "" {
+					continue
+				}
+				ma, err := multiaddr.NewMultiaddr(trimmed)
+				if err == nil {
+					info, err := peer.AddrInfoFromP2pAddr(ma)
+					if err == nil {
+						// Add if not already present
+						exists := false
+						for _, existing := range allowedPeers {
+							if existing == info.ID {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							allowedPeers = append(allowedPeers, info.ID)
+							log.Printf("🔌 Auto-whitelisted Relay Peer ID: %s", info.ID)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	h, dhtObj, err := makeHost(ctx, *secretKeyPathFlag, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to initialize libp2p host: %v", err)
 	}
