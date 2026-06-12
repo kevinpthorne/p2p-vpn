@@ -142,3 +142,13 @@ All parameters can be configured using environment variables (especially useful 
 | `-tun-ip` | `P2P_VPN_TUN_IP` | `""` | Virtual subnet IP/CIDR for the TUN interface |
 | `-advertise` | `P2P_VPN_ADVERTISE` | `""` | Comma-separated list of subnets to route |
 | `-dry-run` | `P2P_VPN_DRY_RUN` | `false` | Enable Mock TUN device for testing |
+
+---
+
+## Known Issues & Limitations
+
+### UDP Subnet Routing Source IP Mismatch
+When routing UDP traffic targeting the VPN host/pod itself via its physical IP address (e.g. `iperf3 -c <physical-ip> -u`), the client receives reply packets with the virtual VPN IP as the source address instead of the physical IP due to the wildcard socket bind. This causes the client to reject the packets.
+
+For a detailed explanation and `iptables` / Kubernetes workaround configurations, see the [Subnet Routing Guide](docs/subnet_routing.md).
+

@@ -14,6 +14,8 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -23,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -51,6 +54,8 @@ type RoutingTable struct {
 	peerInfo      map[peer.ID]*PeerRoutes
 	activeStreams map[peer.ID]network.Stream
 	streamMutexes map[peer.ID]*sync.Mutex
+	queues        map[peer.ID]chan []byte
+	queuesMu      sync.RWMutex
 }
 
 func NewRoutingTable() *RoutingTable {
@@ -59,6 +64,7 @@ func NewRoutingTable() *RoutingTable {
 		peerInfo:      make(map[peer.ID]*PeerRoutes),
 		activeStreams: make(map[peer.ID]network.Stream),
 		streamMutexes: make(map[peer.ID]*sync.Mutex),
+		queues:        make(map[peer.ID]chan []byte),
 	}
 }
 
@@ -106,6 +112,9 @@ func (rt *RoutingTable) UnregisterPeer(pid peer.ID) (virtualIP string, subnets [
 	}
 	delete(rt.streamMutexes, pid)
 
+	// Clean up packet queue
+	rt.CleanQueue(pid)
+
 	return virtualIP, subnets
 }
 
@@ -150,6 +159,100 @@ func (rt *RoutingTable) ClearStream(pid peer.ID) {
 	delete(rt.activeStreams, pid)
 }
 
+func (rt *RoutingTable) ClearStreamIfMatches(pid peer.ID, s network.Stream) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.activeStreams[pid] == s {
+		delete(rt.activeStreams, pid)
+	}
+}
+
+func (rt *RoutingTable) HasPeer(pid peer.ID) bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	_, ok := rt.peerInfo[pid]
+	return ok
+}
+
+func (rt *RoutingTable) GetOrCreateQueue(pid peer.ID, ctx context.Context, h host.Host, dataKey []byte, tunIfce TunInterface) chan []byte {
+	rt.queuesMu.Lock()
+	defer rt.queuesMu.Unlock()
+
+	q, ok := rt.queues[pid]
+	if !ok {
+		q = make(chan []byte, 1024) // Buffer up to 1024 packets
+		rt.queues[pid] = q
+		go rt.peerWorkerLoop(ctx, pid, q, h, dataKey, tunIfce)
+	}
+	return q
+}
+
+func (rt *RoutingTable) CleanQueue(pid peer.ID) {
+	rt.queuesMu.Lock()
+	defer rt.queuesMu.Unlock()
+	if q, ok := rt.queues[pid]; ok {
+		close(q)
+		delete(rt.queues, pid)
+	}
+}
+
+func (rt *RoutingTable) peerWorkerLoop(ctx context.Context, pid peer.ID, q chan []byte, h host.Host, dataKey []byte, tunIfce TunInterface) {
+	log.Printf("👤 Started packet worker loop for peer %s", pid)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case pkt, ok := <-q:
+			if !ok {
+				log.Printf("👤 Stopped packet worker loop for peer %s (queue closed)", pid)
+				return
+			}
+
+			s, ok := rt.GetStream(pid)
+			if !ok {
+				// Open a new outbound stream
+				transientCtx := network.WithAllowLimitedConn(ctx, "vpn-tunnel")
+				var err error
+				s, err = h.NewStream(transientCtx, pid, TunnelProtocol)
+				if err != nil {
+					log.Printf("⚠️ Failed to open outgoing stream to %s: %v", pid, err)
+					// Drop packet and sleep briefly to avoid spinning
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				rt.SetStream(pid, s)
+
+				// Start reader loop on this outbound stream
+				go func(stream network.Stream) {
+					defer stream.Close()
+					defer rt.ClearStreamIfMatches(pid, stream)
+					log.Printf("📥 Reader loop started on outbound tunnel stream to %s", pid)
+					for {
+						packet, err := readFrame(stream, dataKey)
+						if err != nil {
+							break
+						}
+						if _, err := tunIfce.Write(packet); err != nil {
+							log.Printf("⚠️ Failed to inject packet to TUN interface: %v", err)
+						}
+					}
+					log.Printf("❌ Reader loop stopped on outbound tunnel stream to %s", pid)
+				}(s)
+			}
+
+			mu := rt.GetStreamMutex(pid)
+			mu.Lock()
+			err := writeFrame(s, pkt, dataKey)
+			mu.Unlock()
+			if err != nil {
+				log.Printf("⚠️ Failed to write packet frame to peer %s: %v", pid, err)
+				s.Reset()
+				rt.ClearStreamIfMatches(pid, s)
+			}
+		}
+	}
+}
+
 func (rt *RoutingTable) GetStreamMutex(pid peer.ID) *sync.Mutex {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -161,45 +264,45 @@ func (rt *RoutingTable) GetStreamMutex(pid peer.ID) *sync.Mutex {
 	return m
 }
 
-// Cryptography Helpers
-func encryptGCM(plaintext []byte, key []byte) (nonce []byte, ciphertext []byte, err error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-	nonce = make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, nil, err
-	}
-	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
-	return nonce, ciphertext, nil
-}
+// Cryptography Caching & Fast Nonces
+var (
+	dataAEAD   cipher.AEAD
+	nonceSalt  uint32
+	nonceSeq   uint64
+)
 
-func decryptGCM(nonce, ciphertext []byte, key []byte) (plaintext []byte, err error) {
+func InitCipher(key []byte) error {
+	if len(key) == 0 {
+		return nil
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	dataAEAD = gcm
+
+	// Initialize salt with random 4 bytes
+	var salt [4]byte
+	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
+		return err
+	}
+	nonceSalt = binary.BigEndian.Uint32(salt[:])
+	return nil
 }
 
 // Framing Helpers
 func writeFrame(w io.Writer, payload []byte, key []byte) error {
 	var nonce, ciphertext []byte
-	var err error
-	if len(key) > 0 {
-		nonce, ciphertext, err = encryptGCM(payload, key)
-		if err != nil {
-			return err
-		}
+	if dataAEAD != nil {
+		seq := atomic.AddUint64(&nonceSeq, 1)
+		nonce = make([]byte, 12)
+		binary.BigEndian.PutUint32(nonce[0:4], nonceSalt)
+		binary.BigEndian.PutUint64(nonce[4:12], seq)
+		ciphertext = dataAEAD.Seal(nil, nonce, payload, nil)
 	} else {
 		ciphertext = payload
 	}
@@ -230,7 +333,7 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 	totalLen := binary.BigEndian.Uint16(lenBuf)
 
 	nonceSize := 0
-	if len(key) > 0 {
+	if dataAEAD != nil {
 		nonceSize = 12 // Standard AES-GCM nonce size
 	}
 
@@ -243,10 +346,10 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	if len(key) > 0 {
+	if dataAEAD != nil {
 		nonce := buf[:nonceSize]
 		ciphertext := buf[nonceSize:]
-		return decryptGCM(nonce, ciphertext, key)
+		return dataAEAD.Open(nil, nonce, ciphertext, nil)
 	}
 
 	return buf, nil
@@ -277,9 +380,11 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	}
 
 	if mode == "relay" {
+		resources := relay.DefaultResources()
+		resources.Limit = nil // Disable data caps and duration limits on relayed connections
 		opts = append(opts,
 			libp2p.ForceReachabilityPublic(),
-			libp2p.EnableRelayService(),
+			libp2p.EnableRelayService(relay.WithResources(resources)),
 			libp2p.EnableNATService(),
 		)
 	} else {
@@ -369,8 +474,12 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 }
 
 // Handshake execution
-func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string) {
-	transientCtx := network.WithAllowLimitedConn(ctx, "vpn-handshake")
+func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface) {
+	log.Printf("🤝 Sending routing handshake to peer %s", pid)
+	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	transientCtx := network.WithAllowLimitedConn(handshakeCtx, "vpn-handshake")
 	s, err := h.NewStream(transientCtx, pid, HandshakeProtocol)
 	if err != nil {
 		log.Printf("⚠️ Handshake stream creation failed to %s: %v", pid, err)
@@ -378,6 +487,7 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 	}
 	defer s.Close()
 
+	// 1. Write our handshake
 	msg := HandshakeMessage{
 		VirtualIP: localVirtualIP,
 		Subnets:   localSubnets,
@@ -388,5 +498,33 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 		log.Printf("⚠️ Handshake encoding failed: %v", err)
 		return
 	}
-	log.Printf("✅ Handshake successfully sent to %s", pid)
+
+	// 2. Read responder's handshake response
+	var respMsg HandshakeMessage
+	decoder := json.NewDecoder(s)
+	if err := decoder.Decode(&respMsg); err != nil {
+		log.Printf("⚠️ Handshake response decoding failed from %s: %v", pid, err)
+		return
+	}
+	log.Printf("📝 Handshake response: Peer %s reports Virtual IP: %s, Subnets: %v", pid, respMsg.VirtualIP, respMsg.Subnets)
+
+	// 3. Register peer and add routes
+	newSubnets, oldSubnets := routingTable.RegisterPeer(pid, respMsg.VirtualIP, respMsg.Subnets)
+	newSet := make(map[string]bool)
+	for _, s := range newSubnets {
+		newSet[s] = true
+	}
+	for _, s := range oldSubnets {
+		if !newSet[s] {
+			log.Printf("🗑️ Removing obsolete route for peer %s: %s", pid, s)
+			tunIfce.DeleteRoute(s)
+		}
+	}
+	for _, s := range newSubnets {
+		log.Printf("➕ Adding route for peer %s: %s", pid, s)
+		if err := tunIfce.AddRoute(s); err != nil {
+			log.Printf("⚠️ Failed to configure route %s: %v", s, err)
+		}
+	}
+	log.Printf("✅ Handshake successfully completed with %s", pid)
 }

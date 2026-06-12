@@ -1,3 +1,5 @@
+scp -i ~/.ssh/aws-rsa-again.pem p2p-vpn.linux-amd64 ec2-user@98.83.233.254:~/ 
+
 ./p2p-vpn -mode relay -port 4001 -secret swarm.key -cluster my-vpn-cluster
 
 /ip4/172.31.34.205/tcp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9

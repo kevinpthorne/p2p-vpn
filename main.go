@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 )
 
@@ -86,6 +85,9 @@ func main() {
 			}
 			if len(dataKey) != 32 {
 				log.Fatalf("❌ FATAL: Datakey must be 32 bytes (64 hex characters). Got %d bytes", len(dataKey))
+			}
+			if err := InitCipher(dataKey); err != nil {
+				log.Fatalf("❌ FATAL: Failed to initialize fast cipher: %v", err)
 			}
 			log.Println("🔒 AES-256-GCM End-to-End Encryption ENABLED")
 		} else {
@@ -179,7 +181,7 @@ func main() {
 
 	// 8. VPN Handshake and Stream Handlers
 	if *modeFlag == "endpoint" {
-		// Handshake Stream Handler: Receives peer subnets and configures local routing
+		// Handshake Stream Handler: Receives peer subnets, configures local routing, and responds with local subnets
 		h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
 			defer s.Close()
 			remotePeer := s.Conn().RemotePeer()
@@ -214,13 +216,30 @@ func main() {
 					log.Printf("⚠️ Failed to configure route %s: %v", s, err)
 				}
 			}
+
+			// Respond back with our own routing information over the same stream
+			resp := HandshakeMessage{
+				VirtualIP: *tunIPFlag,
+				Subnets:   advertisedSubnets,
+			}
+			encoder := json.NewEncoder(s)
+			if err := encoder.Encode(&resp); err != nil {
+				log.Printf("⚠️ Failed to encode response handshake to %s: %v", remotePeer, err)
+				return
+			}
+			log.Printf("✅ Bidirectional handshake response successfully sent to %s", remotePeer)
 		})
 
 		// Tunnel Data Stream Handler: Decrypts frames and writes packets to TUN
 		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
-			defer s.Close()
 			remotePeer := s.Conn().RemotePeer()
 			log.Printf("📥 Incoming tunnel data stream established from %s", remotePeer)
+
+			// Cache this inbound stream in our routing table to write to it!
+			routingTable.SetStream(remotePeer, s)
+
+			defer s.Close()
+			defer routingTable.ClearStreamIfMatches(remotePeer, s)
 
 			for {
 				packet, err := readFrame(s, dataKey)
@@ -242,8 +261,12 @@ func main() {
 			ConnectedF: func(n network.Network, conn network.Conn) {
 				remotePeer := conn.RemotePeer()
 				log.Printf("🔌 Connected to peer: %s", remotePeer)
+				if routingTable.HasPeer(remotePeer) {
+					log.Printf("🤝 Peer %s already registered in routing table. Skipping handshake push.", remotePeer)
+					return
+				}
 				// Initiate routing info handshake
-				go pushHandshake(ctx, h, remotePeer, *tunIPFlag, advertisedSubnets)
+				go pushHandshake(ctx, h, remotePeer, *tunIPFlag, advertisedSubnets, routingTable, tunIfce)
 			},
 			DisconnectedF: func(n network.Network, conn network.Conn) {
 				remotePeer := conn.RemotePeer()
@@ -366,42 +389,17 @@ func main() {
 					continue
 				}
 
-				// Forward package in separate goroutine to prevent blocking reader loop
-				go func(pid peer.ID, pkt []byte) {
-					mu := routingTable.GetStreamMutex(pid)
-					mu.Lock()
-					defer mu.Unlock()
+				// Copy packet bytes to avoid corruption from shared read buffer
+				pktCopy := make([]byte, len(packet))
+				copy(pktCopy, packet)
 
-					s, ok := routingTable.GetStream(pid)
-					if !ok {
-						transientCtx := network.WithAllowLimitedConn(ctx, "vpn-tunnel")
-						s, err = h.NewStream(transientCtx, pid, TunnelProtocol)
-						if err != nil {
-							log.Printf("⚠️ Failed to open outgoing stream to %s: %v", pid, err)
-							return
-						}
-						routingTable.SetStream(pid, s)
-
-						// Monitor stream closure
-						go func(stream network.Stream) {
-							defer stream.Close()
-							dummy := make([]byte, 1)
-							for {
-								_, err := stream.Read(dummy)
-								if err != nil {
-									routingTable.ClearStream(pid)
-									break
-								}
-							}
-						}(s)
-					}
-
-					if err := writeFrame(s, pkt, dataKey); err != nil {
-						log.Printf("⚠️ Failed to write packet frame to peer %s: %v", pid, err)
-						s.Reset()
-						routingTable.ClearStream(pid)
-					}
-				}(peerID, packet)
+				// Push to peer worker queue
+				q := routingTable.GetOrCreateQueue(peerID, ctx, h, dataKey, tunIfce)
+				select {
+				case q <- pktCopy:
+				default:
+					// Queue full, drop packet silently to handle congestion
+				}
 			}
 		}()
 
