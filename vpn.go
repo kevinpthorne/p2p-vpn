@@ -5,18 +5,21 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/connmgr"
@@ -25,11 +28,17 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
+
+// Global CA and Node signature configuration for PKI authentication
+var (
+	CAPubKey      *mldsa87.PublicKey
+	NodeSignature []byte
+)
+
 
 // WhitelistConnectionGater filters incoming and outgoing connections based on a peer ID whitelist
 type WhitelistConnectionGater struct {
@@ -86,7 +95,104 @@ const (
 type HandshakeMessage struct {
 	VirtualIP string   `json:"virtual_ip"` // e.g. "10.200.0.1/24"
 	Subnets   []string `json:"subnets"`    // e.g. ["10.100.1.0/24"]
+	Signature string   `json:"signature"`  // PEM or hex encoded ML-DSA-87 signature
 }
+
+func encodeSignaturePEM(sigBytes []byte) string {
+	block := &pem.Block{
+		Type:  "ML-DSA-87 SIGNATURE",
+		Bytes: sigBytes,
+	}
+	return string(pem.EncodeToMemory(block))
+}
+
+func decodeSignaturePEM(pemBytes []byte) ([]byte, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "ML-DSA-87 SIGNATURE" {
+		// Fallback to raw hex if not a valid PEM block
+		str := strings.TrimSpace(string(pemBytes))
+		if hexBytes, err := hex.DecodeString(str); err == nil {
+			return hexBytes, nil
+		}
+		return pemBytes, nil
+	}
+	return block.Bytes, nil
+}
+
+func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte) {
+	defer s.Close()
+	remotePeer := s.Conn().RemotePeer()
+	log.Printf("🤝 Incoming handshake stream from %s", remotePeer)
+
+	var msg HandshakeMessage
+	if err := json.NewDecoder(s).Decode(&msg); err != nil {
+		log.Printf("⚠️ Failed to parse handshake message from %s: %v", remotePeer, err)
+		return
+	}
+
+	// Verify CA signature if PKI is enabled
+	if caPubKey != nil {
+		sigBytes, err := decodeSignaturePEM([]byte(msg.Signature))
+		if err != nil || len(sigBytes) == 0 {
+			log.Printf("❌ Incoming handshake rejected: missing or invalid signature format from %s", remotePeer)
+			s.Reset()
+			h.Network().ClosePeer(remotePeer)
+			return
+		}
+		if !mldsa87.Verify(caPubKey, []byte(remotePeer.String()), []byte("p2p-vpn-auth"), sigBytes) {
+			log.Printf("❌ Incoming handshake rejected: signature verification FAILED for %s", remotePeer)
+			s.Reset()
+			h.Network().ClosePeer(remotePeer)
+			return
+		}
+		log.Printf("🛡️ CA signature verified for incoming peer %s", remotePeer)
+	}
+
+	log.Printf("📝 Handshake: Peer %s reports Virtual IP: %s, Subnets: %v", remotePeer, msg.VirtualIP, msg.Subnets)
+
+	// Register peer and configure routes if virtual IP is set
+	if msg.VirtualIP != "" {
+		newSubnets, oldSubnets := routingTable.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
+		if tunIfce != nil {
+			newSet := make(map[string]bool)
+			for _, s := range newSubnets {
+				newSet[s] = true
+			}
+			for _, s := range oldSubnets {
+				if !newSet[s] {
+					log.Printf("🗑️ Removing obsolete route for peer %s: %s", remotePeer, s)
+					tunIfce.DeleteRoute(s)
+				}
+			}
+			for _, s := range newSubnets {
+				log.Printf("➕ Adding route for peer %s: %s", remotePeer, s)
+				if err := tunIfce.AddRoute(s); err != nil {
+					log.Printf("⚠️ Failed to configure route %s: %v", s, err)
+				}
+			}
+		}
+	} else {
+		// Register relay too
+		routingTable.RegisterPeer(remotePeer, "", nil)
+	}
+
+	// Respond back with our own routing information
+	respSig := ""
+	if len(localSignature) > 0 {
+		respSig = encodeSignaturePEM(localSignature)
+	}
+	resp := HandshakeMessage{
+		VirtualIP: localVirtualIP,
+		Subnets:   localSubnets,
+		Signature: respSig,
+	}
+	if err := json.NewEncoder(s).Encode(&resp); err != nil {
+		log.Printf("⚠️ Failed to encode response handshake to %s: %v", remotePeer, err)
+		return
+	}
+	log.Printf("✅ Bidirectional handshake response successfully sent to %s", remotePeer)
+}
+
 
 // PeerRoutes holds routing information for a remote peer
 type PeerRoutes struct {
@@ -402,7 +508,7 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
+func makeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 	udpListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 
@@ -445,32 +551,6 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		gater := NewWhitelistConnectionGater(allowedPeers)
 		opts = append(opts, libp2p.ConnectionGater(gater))
 		log.Printf("🔒 Connection Gater enabled with %d allowed peers", len(allowedPeers))
-	}
-
-	if pskPath != "" {
-		if _, err := os.Stat(pskPath); err == nil {
-			// Private network swarm key
-			pskFile, err := os.Open(pskPath)
-			if err != nil {
-				return nil, nil, fmt.Errorf("could not open swarm.key: %w", err)
-			}
-			defer pskFile.Close()
-
-			pskBytes, err := io.ReadAll(pskFile)
-			if err != nil {
-				return nil, nil, err
-			}
-			pskFile.Seek(0, 0)
-			hash := sha256.Sum256(pskBytes)
-			log.Printf("🔑 Swarm Key Fingerprint: %x", hash)
-
-			psk, err := pnet.DecodeV1PSK(pskFile)
-			if err != nil {
-				return nil, nil, fmt.Errorf("invalid swarm.key format: %w", err)
-			}
-			opts = append(opts, libp2p.PrivateNetwork(psk))
-			log.Println("🔑 Swarm Key (pnet) protection enabled (TCP-only mode enforced)")
-		}
 	}
 
 	h, err := libp2p.New(opts...)
@@ -531,7 +611,7 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 }
 
 // Handshake execution
-func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface) {
+func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte) {
 	log.Printf("🤝 Sending routing handshake to peer %s", pid)
 	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -545,9 +625,14 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 	defer s.Close()
 
 	// 1. Write our handshake
+	localSig := ""
+	if len(localSignature) > 0 {
+		localSig = encodeSignaturePEM(localSignature)
+	}
 	msg := HandshakeMessage{
 		VirtualIP: localVirtualIP,
 		Subnets:   localSubnets,
+		Signature: localSig,
 	}
 
 	encoder := json.NewEncoder(s)
@@ -563,25 +648,72 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 		log.Printf("⚠️ Handshake response decoding failed from %s: %v", pid, err)
 		return
 	}
+
+	// Verify CA signature if PKI is enabled
+	if caPubKey != nil {
+		sigBytes, err := decodeSignaturePEM([]byte(respMsg.Signature))
+		if err != nil || len(sigBytes) == 0 {
+			log.Printf("❌ Outbound handshake rejected: missing or invalid signature format from %s", pid)
+			s.Reset()
+			h.Network().ClosePeer(pid)
+			return
+		}
+		if !mldsa87.Verify(caPubKey, []byte(pid.String()), []byte("p2p-vpn-auth"), sigBytes) {
+			log.Printf("❌ Outbound handshake rejected: signature verification FAILED for %s", pid)
+			s.Reset()
+			h.Network().ClosePeer(pid)
+			return
+		}
+		log.Printf("🛡️ CA signature verified for outbound peer %s", pid)
+	}
+
 	log.Printf("📝 Handshake response: Peer %s reports Virtual IP: %s, Subnets: %v", pid, respMsg.VirtualIP, respMsg.Subnets)
 
 	// 3. Register peer and add routes
-	newSubnets, oldSubnets := routingTable.RegisterPeer(pid, respMsg.VirtualIP, respMsg.Subnets)
-	newSet := make(map[string]bool)
-	for _, s := range newSubnets {
-		newSet[s] = true
-	}
-	for _, s := range oldSubnets {
-		if !newSet[s] {
-			log.Printf("🗑️ Removing obsolete route for peer %s: %s", pid, s)
-			tunIfce.DeleteRoute(s)
+	if respMsg.VirtualIP != "" {
+		newSubnets, oldSubnets := routingTable.RegisterPeer(pid, respMsg.VirtualIP, respMsg.Subnets)
+		if tunIfce != nil {
+			newSet := make(map[string]bool)
+			for _, s := range newSubnets {
+				newSet[s] = true
+			}
+			for _, s := range oldSubnets {
+				if !newSet[s] {
+					log.Printf("🗑️ Removing obsolete route for peer %s: %s", pid, s)
+					tunIfce.DeleteRoute(s)
+				}
+			}
+			for _, s := range newSubnets {
+				log.Printf("➕ Adding route for peer %s: %s", pid, s)
+				if err := tunIfce.AddRoute(s); err != nil {
+					log.Printf("⚠️ Failed to configure route %s: %v", s, err)
+				}
+			}
 		}
-	}
-	for _, s := range newSubnets {
-		log.Printf("➕ Adding route for peer %s: %s", pid, s)
-		if err := tunIfce.AddRoute(s); err != nil {
-			log.Printf("⚠️ Failed to configure route %s: %v", s, err)
-		}
+	} else {
+		// Register relay too
+		routingTable.RegisterPeer(pid, "", nil)
 	}
 	log.Printf("✅ Handshake successfully completed with %s", pid)
 }
+
+func StartCAAuthKicker(ctx context.Context, h host.Host, routingTable *RoutingTable, remotePeer peer.ID, caPubKey *mldsa87.PublicKey) {
+	if caPubKey == nil {
+		return // PKI not enforced, no kicker needed
+	}
+	go func() {
+		// Wait up to 5 seconds for the handshake to finish
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+
+		// If the peer is not registered in the routing table (handshake completed), disconnect it
+		if !routingTable.HasPeer(remotePeer) {
+			log.Printf("⚠️ Peer %s failed to authenticate via CA signature within 5 seconds. Disconnecting...", remotePeer)
+			h.Network().ClosePeer(remotePeer)
+		}
+	}()
+}
+

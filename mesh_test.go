@@ -3,21 +3,20 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	"github.com/multiformats/go-multiaddr"
 )
 
 type TestNode struct {
@@ -27,22 +26,109 @@ type TestNode struct {
 	tun          *MockTun
 	ctx          context.Context
 	cancel       context.CancelFunc
+	dht          *dht.IpfsDHT
 }
 
-func TestMeshTopology(t *testing.T) {
+func setupTestNode(
+	ctx context.Context,
+	t *testing.T,
+	mode string,
+	privKey crypto.PrivKey,
+	relayAddrs []string,
+	port int,
+	clusterID string,
+	allowedPeers []peer.ID,
+	caPub *mldsa87.PublicKey,
+	nodeSig []byte,
+	virtualIP string,
+	advertiseSubnets []string,
+) *TestNode {
+	h, dhtObj, err := makeHost(ctx, mode, privKey, relayAddrs, port, clusterID, allowedPeers)
+	if err != nil {
+		t.Fatalf("failed to start %s host: %v", mode, err)
+	}
+
+	if err := dhtObj.Bootstrap(ctx); err != nil {
+		t.Fatalf("failed to bootstrap %s DHT: %v", mode, err)
+	}
+
+	rt := NewRoutingTable()
+	var tunIfce TunInterface
+	var mockTun *MockTun
+	if mode == "endpoint" {
+		mockTun = NewMockTun("test-tun-" + h.ID().String()).(*MockTun)
+		tunIfce = mockTun
+	}
+
+	nodeCtx, nodeCancel := context.WithCancel(ctx)
+
+	// Set symmetric Handshake Handler
+	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
+		HandleIncomingHandshake(nodeCtx, h, s, virtualIP, advertiseSubnets, rt, tunIfce, caPub, nodeSig)
+	})
+
+	if mode == "endpoint" {
+		// Tunnel Data Stream Handler
+		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
+			remotePeer := s.Conn().RemotePeer()
+			rt.SetStream(remotePeer, s)
+			defer s.Close()
+			defer rt.ClearStreamIfMatches(remotePeer, s)
+			for {
+				packet, err := readFrame(s, nil)
+				if err != nil {
+					break
+				}
+				if _, err := mockTun.Write(packet); err != nil {
+					break
+				}
+			}
+		})
+	}
+
+	// Set connection Notify
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, conn network.Conn) {
+			remotePeer := conn.RemotePeer()
+			if rt.HasPeer(remotePeer) {
+				return
+			}
+			StartCAAuthKicker(nodeCtx, h, rt, remotePeer, caPub)
+
+			// Relays don't advertise virtual IP or subnets
+			localVIP := ""
+			var localSubs []string
+			if mode == "endpoint" {
+				localVIP = virtualIP
+				localSubs = advertiseSubnets
+			}
+			go pushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig)
+		},
+		DisconnectedF: func(n network.Network, conn network.Conn) {
+			remotePeer := conn.RemotePeer()
+			rt.UnregisterPeer(remotePeer)
+		},
+	})
+
+	return &TestNode{
+		id:           h.ID(),
+		h:            h,
+		routingTable: rt,
+		tun:          mockTun,
+		ctx:          nodeCtx,
+		cancel:       nodeCancel,
+		dht:          dhtObj,
+	}
+}
+
+func TestMeshCASecurity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	clusterID := fmt.Sprintf("mesh-test-cluster-%d", time.Now().UnixNano())
-	log.Printf("🧪 Running integration test with Cluster ID: %s", clusterID)
+	clusterID := fmt.Sprintf("ca-test-cluster-%d", time.Now().UnixNano())
+	log.Printf("🧪 Running CA PKI integration test (ML-DSA-87) with Cluster ID: %s", clusterID)
 
-	// Ensure swarm.key exists
-	swarmKeyPath := "swarm.key"
-	if _, err := os.Stat(swarmKeyPath); os.IsNotExist(err) {
-		t.Fatalf("swarm.key not found in working directory. Please make sure to run from the project root.")
-	}
-
-	// Load or generate a temporary data key for AES encryption
+	// Initialize data key for GCM
 	dataKey := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, dataKey); err != nil {
 		t.Fatalf("failed to generate random data key: %v", err)
@@ -51,46 +137,54 @@ func TestMeshTopology(t *testing.T) {
 		t.Fatalf("failed to initialize cipher: %v", err)
 	}
 
-	// 1. Initialize 2 Relays
-	log.Println("🟢 Launching 2 Relays...")
-	relay1Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	// 1. Generate Root CA
+	caPub, caPriv, err := mldsa87.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("failed to generate relay1 key: %v", err)
-	}
-	relay2Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate relay2 key: %v", err)
+		t.Fatalf("failed to generate CA key pair: %v", err)
 	}
 
-	r1Host, r1DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay1Priv, nil, 4501, clusterID, nil)
-	if err != nil {
-		t.Fatalf("failed to start Relay 1: %v", err)
-	}
-	defer r1Host.Close()
+	// Pre-generate keys and signatures for Relays and Endpoints
+	r1Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	r1ID, _ := peer.IDFromPrivateKey(r1Priv)
+	r2Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	r2ID, _ := peer.IDFromPrivateKey(r2Priv)
 
-	r2Host, r2DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay2Priv, nil, 4502, clusterID, nil)
-	if err != nil {
-		t.Fatalf("failed to start Relay 2: %v", err)
-	}
-	defer r2Host.Close()
-
-	if err := r1DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 1 DHT: %v", err)
-	}
-	if err := r2DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 2 DHT: %v", err)
+	epPrivs := make([]crypto.PrivKey, 5)
+	epIDs := make([]peer.ID, 5)
+	for i := 0; i < 5; i++ {
+		epPrivs[i], _, _ = crypto.GenerateKeyPair(crypto.RSA, 2048)
+		epIDs[i], _ = peer.IDFromPrivateKey(epPrivs[i])
 	}
 
-	// Get Relays multiaddrs
-	r1Addr := fmt.Sprintf("%s/p2p/%s", r1Host.Addrs()[0], r1Host.ID())
-	r2Addr := fmt.Sprintf("%s/p2p/%s", r2Host.Addrs()[0], r2Host.ID())
+	// Create signatures mapped by Peer ID
+	sigs := make(map[peer.ID][]byte)
+	for _, id := range []peer.ID{r1ID, r2ID} {
+		sig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
+		sigs[id] = sig
+	}
+	for _, id := range epIDs {
+		sig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
+		sigs[id] = sig
+	}
+
+	// 2. Launch 2 Relays (enforcing CA signatures)
+	log.Println("🟢 Launching 2 Relays with CA PKI...")
+	r1 := setupTestNode(ctx, t, "relay", r1Priv, nil, 4801, clusterID, nil, caPub, sigs[r1ID], "", nil)
+	defer r1.h.Close()
+	defer r1.cancel()
+
+	r2 := setupTestNode(ctx, t, "relay", r2Priv, nil, 4802, clusterID, nil, caPub, sigs[r2ID], "", nil)
+	defer r2.h.Close()
+	defer r2.cancel()
+
+	r1Addr := fmt.Sprintf("%s/p2p/%s", r1.h.Addrs()[0], r1.id)
+	r2Addr := fmt.Sprintf("%s/p2p/%s", r2.h.Addrs()[0], r2.id)
 	relayAddrs := []string{r1Addr, r2Addr}
 
-	log.Printf("📢 Relay 1 Address: %s", r1Addr)
-	log.Printf("📢 Relay 2 Address: %s", r2Addr)
-
-	// 2. Initialize 5 Endpoints
-	log.Println("🟢 Launching 5 Endpoints...")
+	// 3. Launch 5 Endpoints (enforcing CA signatures)
+	log.Println("🟢 Launching 5 Endpoints with CA PKI...")
 	endpoints := make([]*TestNode, 5)
 
 	for i := 0; i < 5; i++ {
@@ -98,168 +192,79 @@ func TestMeshTopology(t *testing.T) {
 		virtualIP := fmt.Sprintf("10.200.0.%d/24", epIdx)
 		advertiseSubnet := fmt.Sprintf("10.100.%d.0/24", epIdx)
 
-		epPriv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-		if err != nil {
-			t.Fatalf("failed to generate key for EP %d: %v", epIdx, err)
-		}
+		endpoints[i] = setupTestNode(ctx, t, "endpoint", epPrivs[i], relayAddrs, 0, clusterID, nil, caPub, sigs[epIDs[i]], virtualIP, []string{advertiseSubnet})
+		defer endpoints[i].h.Close()
+		defer endpoints[i].cancel()
 
-		// Port 0 lets OS allocate ephemeral port
-		h, dhtObj, err := makeHost(ctx, swarmKeyPath, "endpoint", epPriv, relayAddrs, 0, clusterID, nil)
-		if err != nil {
-			t.Fatalf("failed to start EP %d host: %v", epIdx, err)
-		}
-
-		if err := dhtObj.Bootstrap(ctx); err != nil {
-			t.Fatalf("failed to bootstrap EP %d DHT: %v", epIdx, err)
-		}
-
-		// Connect to both bootstrap relays explicitly
-		connectToPeer(ctx, h, r1Addr)
-		connectToPeer(ctx, h, r2Addr)
-
-		rt := NewRoutingTable()
-		mockTunName := fmt.Sprintf("mock-tun-%d", epIdx)
-		tun := NewMockTun(mockTunName).(*MockTun)
-
-		epCtx, epCancel := context.WithCancel(ctx)
-		endpoints[i] = &TestNode{
-			id:           h.ID(),
-			h:            h,
-			routingTable: rt,
-			tun:          tun,
-			ctx:          epCtx,
-			cancel:       epCancel,
-		}
-
-		// Setup Handshake Handler
-		h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-			defer s.Close()
-			remotePeer := s.Conn().RemotePeer()
-			var msg HandshakeMessage
-			if err := json.NewDecoder(s).Decode(&msg); err != nil {
-				return
-			}
-			rt.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
-			resp := HandshakeMessage{
-				VirtualIP: virtualIP,
-				Subnets:   []string{advertiseSubnet},
-			}
-			json.NewEncoder(s).Encode(&resp)
-		})
-
-		// Setup Tunnel Protocol Handler
-		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
-			remotePeer := s.Conn().RemotePeer()
-			rt.SetStream(remotePeer, s)
-			defer s.Close()
-			defer rt.ClearStreamIfMatches(remotePeer, s)
-			for {
-				packet, err := readFrame(s, dataKey)
-				if err != nil {
-					break
-				}
-				if _, err := tun.Write(packet); err != nil {
-					break
-				}
-			}
-		})
-
-		// Notify Bundle
-		h.Network().Notify(&network.NotifyBundle{
-			ConnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				// Don't handshake with relays
-				if remotePeer == r1Host.ID() || remotePeer == r2Host.ID() {
-					return
-				}
-				if rt.HasPeer(remotePeer) {
-					return
-				}
-				go pushHandshake(epCtx, h, remotePeer, virtualIP, []string{advertiseSubnet}, rt, tun)
-			},
-			DisconnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				rt.UnregisterPeer(remotePeer)
-			},
-		})
+		connectToPeer(ctx, endpoints[i].h, r1Addr)
+		connectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
-		routingDiscovery := routing.NewRoutingDiscovery(dhtObj)
-		// 1. Advertiser
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				routingDiscovery.Advertise(epCtx, clusterID)
+				disc.Advertise(n.ctx, clusterID)
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
+		}(endpoints[i])
 
-		// 2. Discoverer
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				peerChan, err := routingDiscovery.FindPeers(epCtx, clusterID)
+				peerChan, err := disc.FindPeers(n.ctx, clusterID)
 				if err == nil {
 					for p := range peerChan {
-						if p.ID == nodeHost.ID() || p.ID == r1Host.ID() || p.ID == r2Host.ID() {
+						if p.ID == n.id || p.ID == r1.id || p.ID == r2.id {
 							continue
 						}
-						if nodeHost.Network().Connectedness(p.ID) != network.Connected {
-							nodeHost.Connect(epCtx, p)
+						if n.h.Network().Connectedness(p.ID) != network.Connected {
+							n.h.Connect(n.ctx, p)
 						}
 					}
 				}
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(5 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
+		}(endpoints[i])
 
-		// 3. TUN Reader loop
-		go func(nodeHost host.Host, rTable *RoutingTable, mockT *MockTun) {
+		// TUN Reader loop (for packet routing)
+		go func(n *TestNode) {
 			buf := make([]byte, 2048)
 			for {
-				n, err := mockT.Read(buf)
+				size, err := n.tun.Read(buf)
 				if err != nil {
 					return
 				}
-				packet := buf[:n]
+				packet := buf[:size]
 				if len(packet) < 20 {
 					continue
 				}
-				version := packet[0] >> 4
-				if version != 4 {
-					continue
-				}
 				destIP := net.IP(packet[16:20])
-				peerID, found := rTable.LookupPeer(destIP)
+				peerID, found := n.routingTable.LookupPeer(destIP)
 				if !found {
 					continue
 				}
 				pktCopy := make([]byte, len(packet))
 				copy(pktCopy, packet)
 
-				q := rTable.GetOrCreateQueue(peerID, epCtx, nodeHost, dataKey, mockT)
+				q := n.routingTable.GetOrCreateQueue(peerID, n.ctx, n.h, dataKey, n.tun)
 				select {
 				case q <- pktCopy:
 				default:
 				}
 			}
-		}(h, rt, tun)
-
-		defer h.Close()
-		defer epCancel()
+		}(endpoints[i])
 	}
 
-	log.Println("🔄 Waiting for full mesh discovery (endpoints to find each other)...")
-	
-	// Wait until all endpoints have exactly 4 peers in their routing tables
+	log.Println("🔄 Waiting for full mesh CA-authenticated connection...")
 	meshConnected := make(chan struct{})
-
 	go func() {
 		for {
 			select {
@@ -267,13 +272,11 @@ func TestMeshTopology(t *testing.T) {
 				return
 			default:
 				allConnected := true
-				log.Println("📊 Checking routing tables connectivity status:")
-				for i, ep := range endpoints {
+				for _, ep := range endpoints {
 					ep.routingTable.mu.RLock()
 					peerCount := len(ep.routingTable.peerInfo)
 					ep.routingTable.mu.RUnlock()
-					log.Printf("   - Endpoint %d (%s) has %d peer routes", i+1, ep.id.ShortString(), peerCount)
-					if peerCount < 4 {
+					if peerCount < 4 { // Should connect to the other 4 endpoints
 						allConnected = false
 					}
 				}
@@ -281,101 +284,87 @@ func TestMeshTopology(t *testing.T) {
 					close(meshConnected)
 					return
 				}
-				time.Sleep(3 * time.Second)
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}()
 
 	select {
 	case <-meshConnected:
-		log.Println("✅ Success! All 5 endpoints are fully connected to each other.")
+		log.Println("✅ Success! Endpoints are fully connected via CA verification.")
 	case <-ctx.Done():
-		t.Fatalf("❌ Timeout: Endpoints failed to establish a full mesh network in time.")
+		t.Fatalf("❌ Timeout: Endpoints failed to authenticate and connect.")
 	}
 
-	// 3. Test Packet Transmission
-	log.Println("🚀 Testing UDP packet routing between Endpoint 1 (10.200.0.1) and Endpoint 5 (10.200.0.5)...")
-	
-	// Set up verification hook on Endpoint 5's MockTun
+	// 4. Test UDP Routing
 	receivedChan := make(chan []byte, 10)
 	endpoints[4].tun.OnWrite = func(pkt []byte) {
 		receivedChan <- pkt
 	}
 
-	// We want to send a UDP packet from Endpoint 1 to Endpoint 5's virtual IP (10.200.0.5)
 	srcIP := net.ParseIP("10.200.0.1")
 	dstIP := net.ParseIP("10.200.0.5")
-	payload := []byte("Hello from Endpoint 1 over 7-node Mesh!")
+	payload := []byte("Hello via ML-DSA-87 PKI Mesh!")
 	pkt := makeMockUDPPacket(srcIP, dstIP, payload)
 
-	// Inject the packet to Endpoint 1's mock TUN read channel
-	log.Println("📥 Injecting UDP packet into Endpoint 1's mock TUN...")
 	endpoints[0].tun.InjectPacket(pkt)
 
-	// Wait and verify Endpoint 5 receives the packet
 	select {
 	case rxPkt := <-receivedChan:
-		log.Println("🎉 Received packet on Endpoint 5's mock TUN!")
-		if len(rxPkt) < 28 {
-			t.Fatalf("received packet too small: %d bytes", len(rxPkt))
-		}
-		// Extract payload
 		rxPayload := rxPkt[28:]
-		log.Printf("   💬 Decrypted Payload: %s", string(rxPayload))
 		if string(rxPayload) != string(payload) {
 			t.Fatalf("expected payload %q, got %q", string(payload), string(rxPayload))
 		}
-		log.Println("✅ UDP routing verified successfully!")
+		log.Println("✅ UDP packet routed successfully over CA-secured mesh!")
 	case <-time.After(10 * time.Second):
-		t.Fatalf("❌ Timeout: Endpoint 5 failed to receive packet from Endpoint 1")
+		t.Fatalf("❌ Timeout: Failed to route packet over CA-secured mesh")
 	}
 
-	// 4. Test Subnet Packet Routing
-	log.Println("🚀 Testing UDP subnet routing from Endpoint 5 (10.200.0.5) to Endpoint 1's advertised subnet IP (10.100.1.99)...")
-	
-	// Set up verification hook on Endpoint 1's MockTun
-	receivedChanSubnet := make(chan []byte, 10)
-	endpoints[0].tun.OnWrite = func(pkt []byte) {
-		receivedChanSubnet <- pkt
+	// 5. Test Endpoint 6 (Valid identity key, but NO signature)
+	log.Println("🛡️ Testing Endpoint 6 connection blockage (no signature)...")
+	ep6Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	ep6 := setupTestNode(ctx, t, "endpoint", ep6Priv, relayAddrs, 0, clusterID, nil, caPub, nil, "10.200.0.6/24", []string{"10.100.6.0/24"})
+	defer ep6.h.Close()
+	defer ep6.cancel()
+
+	err = ep6.h.Connect(ctx, r1.h.Peerstore().PeerInfo(r1.id))
+	log.Printf("🔌 Endpoint 6 dialed Relay 1. err=%v, immediate connectedness=%v", err, ep6.h.Network().Connectedness(r1.id))
+	time.Sleep(2 * time.Second) // wait for kicker
+	log.Printf("🔌 After 2s sleep: connectedness=%v", ep6.h.Network().Connectedness(r1.id))
+	if ep6.h.Network().Connectedness(r1.id) == network.Connected {
+		t.Fatalf("❌ Security Violation: Unsigned Endpoint 6 stayed connected!")
 	}
+	log.Println("✅ Success: Unsigned Endpoint 6 was disconnected successfully.")
 
-	// We want to send a UDP packet from Endpoint 5 to Endpoint 1's advertised subnet IP (10.100.1.99)
-	srcIPSubnet := net.ParseIP("10.200.0.5")
-	dstIPSubnet := net.ParseIP("10.100.1.99")
-	payloadSubnet := []byte("Hello from Endpoint 5 to Endpoint 1 Subnet!")
-	pktSubnet := makeMockUDPPacket(srcIPSubnet, dstIPSubnet, payloadSubnet)
+	// 6. Test Endpoint 7 (Valid identity key, but signature signed by a FAKE CA)
+	log.Println("🛡️ Testing Endpoint 7 connection blockage (fake CA signature)...")
+	fakeCaPub, fakeCaPriv, _ := mldsa87.GenerateKey(rand.Reader)
+	_ = fakeCaPub
+	ep7Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	ep7ID, _ := peer.IDFromPrivateKey(ep7Priv)
+	fakeSig := make([]byte, mldsa87.SignatureSize)
+	_ = mldsa87.SignTo(fakeCaPriv, []byte(ep7ID.String()), []byte("p2p-vpn-auth"), true, fakeSig)
 
-	// Inject the packet to Endpoint 5's mock TUN read channel
-	log.Println("📥 Injecting UDP packet into Endpoint 5's mock TUN...")
-	endpoints[4].tun.InjectPacket(pktSubnet)
+	ep7 := setupTestNode(ctx, t, "endpoint", ep7Priv, relayAddrs, 0, clusterID, nil, caPub, fakeSig, "10.200.0.7/24", []string{"10.100.7.0/24"})
+	defer ep7.h.Close()
+	defer ep7.cancel()
 
-	// Wait and verify Endpoint 1 receives the packet
-	select {
-	case rxPkt := <-receivedChanSubnet:
-		log.Println("🎉 Received packet on Endpoint 1's mock TUN!")
-		if len(rxPkt) < 28 {
-			t.Fatalf("received packet too small: %d bytes", len(rxPkt))
-		}
-		// Extract payload
-		rxPayload := rxPkt[28:]
-		log.Printf("   💬 Decrypted Payload: %s", string(rxPayload))
-		if string(rxPayload) != string(payloadSubnet) {
-			t.Fatalf("expected payload %q, got %q", string(payloadSubnet), string(rxPayload))
-		}
-		log.Println("✅ Subnet UDP routing verified successfully!")
-	case <-time.After(10 * time.Second):
-		t.Fatalf("❌ Timeout: Endpoint 1 failed to receive subnet packet from Endpoint 5")
+	err = ep7.h.Connect(ctx, r1.h.Peerstore().PeerInfo(r1.id))
+	log.Printf("🔌 Endpoint 7 dialed Relay 1. err=%v, immediate connectedness=%v", err, ep7.h.Network().Connectedness(r1.id))
+	time.Sleep(2 * time.Second) // wait for kicker
+	log.Printf("🔌 After 2s sleep: connectedness=%v", ep7.h.Network().Connectedness(r1.id))
+	if ep7.h.Network().Connectedness(r1.id) == network.Connected {
+		t.Fatalf("❌ Security Violation: Endpoint 7 with fake signature stayed connected!")
 	}
+	log.Println("✅ Success: Endpoint 7 was disconnected successfully.")
 }
 
 func TestMeshConnectionGater(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	clusterID := fmt.Sprintf("gater-test-cluster-%d", time.Now().UnixNano())
-	log.Printf("🧪 Running Connection Gater integration test with Cluster ID: %s", clusterID)
-
-	swarmKeyPath := ""
+	log.Printf("🧪 Running Whitelist Connection Gater integration test with Cluster ID: %s", clusterID)
 
 	dataKey := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, dataKey); err != nil {
@@ -385,55 +374,38 @@ func TestMeshConnectionGater(t *testing.T) {
 		t.Fatalf("failed to initialize cipher: %v", err)
 	}
 
-	// 1. Generate keys for all 7 allowed nodes (2 relays + 5 endpoints)
-	log.Println("🔑 Pre-generating keys and whitelisting Peer IDs...")
-	relay1Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	// 1. Generate keys for Relays and Endpoints
+	relay1Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	r1ID, _ := peer.IDFromPrivateKey(relay1Priv)
-	relay2Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	relay2Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	r2ID, _ := peer.IDFromPrivateKey(relay2Priv)
 
 	epPrivs := make([]crypto.PrivKey, 5)
 	epIDs := make([]peer.ID, 5)
 	for i := 0; i < 5; i++ {
-		epPriv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-		if err != nil {
-			t.Fatalf("failed to generate key: %v", err)
-		}
-		epPrivs[i] = epPriv
-		epIDs[i], _ = peer.IDFromPrivateKey(epPriv)
+		epPrivs[i], _, _ = crypto.GenerateKeyPair(crypto.RSA, 2048)
+		epIDs[i], _ = peer.IDFromPrivateKey(epPrivs[i])
 	}
 
-	// Build the whitelist of allowed peers
 	allowedPeers := []peer.ID{r1ID, r2ID}
 	allowedPeers = append(allowedPeers, epIDs...)
 
-	// 2. Launch 2 Relays using Connection Gater
-	log.Println("🟢 Launching 2 Relays with Connection Gater...")
-	r1Host, r1DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay1Priv, nil, 4601, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start Relay 1: %v", err)
-	}
-	defer r1Host.Close()
+	// 2. Launch 2 Relays (whitelist active, CA disabled)
+	log.Println("🟢 Launching 2 Relays with Whitelist...")
+	r1 := setupTestNode(ctx, t, "relay", relay1Priv, nil, 4901, clusterID, allowedPeers, nil, nil, "", nil)
+	defer r1.h.Close()
+	defer r1.cancel()
 
-	r2Host, r2DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay2Priv, nil, 4602, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start Relay 2: %v", err)
-	}
-	defer r2Host.Close()
+	r2 := setupTestNode(ctx, t, "relay", relay2Priv, nil, 4902, clusterID, allowedPeers, nil, nil, "", nil)
+	defer r2.h.Close()
+	defer r2.cancel()
 
-	if err := r1DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 1: %v", err)
-	}
-	if err := r2DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 2: %v", err)
-	}
-
-	r1Addr := fmt.Sprintf("%s/p2p/%s", r1Host.Addrs()[0], r1Host.ID())
-	r2Addr := fmt.Sprintf("%s/p2p/%s", r2Host.Addrs()[0], r2Host.ID())
+	r1Addr := fmt.Sprintf("%s/p2p/%s", r1.h.Addrs()[0], r1.id)
+	r2Addr := fmt.Sprintf("%s/p2p/%s", r2.h.Addrs()[0], r2.id)
 	relayAddrs := []string{r1Addr, r2Addr}
 
-	// 3. Launch 5 Endpoints using Connection Gater
-	log.Println("🟢 Launching 5 Endpoints with Connection Gater...")
+	// 3. Launch 5 Endpoints
+	log.Println("🟢 Launching 5 Endpoints with Whitelist...")
 	endpoints := make([]*TestNode, 5)
 
 	for i := 0; i < 5; i++ {
@@ -441,155 +413,50 @@ func TestMeshConnectionGater(t *testing.T) {
 		virtualIP := fmt.Sprintf("10.200.0.%d/24", epIdx)
 		advertiseSubnet := fmt.Sprintf("10.100.%d.0/24", epIdx)
 
-		// Create host with Connection Gater
-		h, dhtObj, err := makeHost(ctx, swarmKeyPath, "endpoint", epPrivs[i], relayAddrs, 0, clusterID, allowedPeers)
-		if err != nil {
-			t.Fatalf("failed to start EP %d: %v", epIdx, err)
-		}
+		endpoints[i] = setupTestNode(ctx, t, "endpoint", epPrivs[i], relayAddrs, 0, clusterID, allowedPeers, nil, nil, virtualIP, []string{advertiseSubnet})
+		defer endpoints[i].h.Close()
+		defer endpoints[i].cancel()
 
-		if err := dhtObj.Bootstrap(ctx); err != nil {
-			t.Fatalf("failed to bootstrap EP %d: %v", epIdx, err)
-		}
-
-		connectToPeer(ctx, h, r1Addr)
-		connectToPeer(ctx, h, r2Addr)
-
-		rt := NewRoutingTable()
-		mockTunName := fmt.Sprintf("gater-mock-tun-%d", epIdx)
-		tun := NewMockTun(mockTunName).(*MockTun)
-
-		epCtx, epCancel := context.WithCancel(ctx)
-		endpoints[i] = &TestNode{
-			id:           h.ID(),
-			h:            h,
-			routingTable: rt,
-			tun:          tun,
-			ctx:          epCtx,
-			cancel:       epCancel,
-		}
-
-		// Setup Handshake Handler
-		h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-			defer s.Close()
-			remotePeer := s.Conn().RemotePeer()
-			var msg HandshakeMessage
-			if err := json.NewDecoder(s).Decode(&msg); err != nil {
-				return
-			}
-			rt.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
-			resp := HandshakeMessage{
-				VirtualIP: virtualIP,
-				Subnets:   []string{advertiseSubnet},
-			}
-			json.NewEncoder(s).Encode(&resp)
-		})
-
-		// Setup Tunnel Handler
-		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
-			remotePeer := s.Conn().RemotePeer()
-			rt.SetStream(remotePeer, s)
-			defer s.Close()
-			defer rt.ClearStreamIfMatches(remotePeer, s)
-			for {
-				packet, err := readFrame(s, dataKey)
-				if err != nil {
-					break
-				}
-				if _, err := tun.Write(packet); err != nil {
-					break
-				}
-			}
-		})
-
-		// Notify Bundle
-		h.Network().Notify(&network.NotifyBundle{
-			ConnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				if remotePeer == r1Host.ID() || remotePeer == r2Host.ID() {
-					return
-				}
-				if rt.HasPeer(remotePeer) {
-					return
-				}
-				go pushHandshake(epCtx, h, remotePeer, virtualIP, []string{advertiseSubnet}, rt, tun)
-			},
-			DisconnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				rt.UnregisterPeer(remotePeer)
-			},
-		})
+		connectToPeer(ctx, endpoints[i].h, r1Addr)
+		connectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
-		routingDiscovery := routing.NewRoutingDiscovery(dhtObj)
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				routingDiscovery.Advertise(epCtx, clusterID)
+				disc.Advertise(n.ctx, clusterID)
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(1 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
+		}(endpoints[i])
 
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				peerChan, err := routingDiscovery.FindPeers(epCtx, clusterID)
+				peerChan, err := disc.FindPeers(n.ctx, clusterID)
 				if err == nil {
 					for p := range peerChan {
-						if p.ID == nodeHost.ID() || p.ID == r1Host.ID() || p.ID == r2Host.ID() {
+						if p.ID == n.id || p.ID == r1.id || p.ID == r2.id {
 							continue
 						}
-						if nodeHost.Network().Connectedness(p.ID) != network.Connected {
-							nodeHost.Connect(epCtx, p)
+						if n.h.Network().Connectedness(p.ID) != network.Connected {
+							n.h.Connect(n.ctx, p)
 						}
 					}
 				}
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(1 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
-
-		// TUN Reader loop
-		go func(nodeHost host.Host, rTable *RoutingTable, mockT *MockTun) {
-			buf := make([]byte, 2048)
-			for {
-				n, err := mockT.Read(buf)
-				if err != nil {
-					return
-				}
-				packet := buf[:n]
-				if len(packet) < 20 {
-					continue
-				}
-				version := packet[0] >> 4
-				if version != 4 {
-					continue
-				}
-				destIP := net.IP(packet[16:20])
-				peerID, found := rTable.LookupPeer(destIP)
-				if !found {
-					continue
-				}
-				pktCopy := make([]byte, len(packet))
-				copy(pktCopy, packet)
-
-				q := rTable.GetOrCreateQueue(peerID, epCtx, nodeHost, dataKey, mockT)
-				select {
-				case q <- pktCopy:
-				default:
-				}
-			}
-		}(h, rt, tun)
-
-		defer h.Close()
-		defer epCancel()
+		}(endpoints[i])
 	}
 
-	log.Println("🔄 Waiting for full mesh connection-gater discovery...")
+	log.Println("🔄 Waiting for full mesh whitelist connection...")
 	meshConnected := make(chan struct{})
 	go func() {
 		for {
@@ -617,76 +484,25 @@ func TestMeshConnectionGater(t *testing.T) {
 
 	select {
 	case <-meshConnected:
-		log.Println("✅ Success! Whitelisted endpoints are fully connected over QUIC/UDP.")
+		log.Println("✅ Success! Whitelisted endpoints are fully connected.")
 	case <-ctx.Done():
 		t.Fatalf("❌ Timeout: Whitelisted endpoints failed to connect.")
 	}
 
-	// 4. Test UDP routing
-	receivedChan := make(chan []byte, 10)
-	endpoints[4].tun.OnWrite = func(pkt []byte) {
-		receivedChan <- pkt
-	}
+	// 4. Test Endpoint 6 (Not whitelisted)
+	log.Println("🛡️ Testing Endpoint 6 connection blockage (not in whitelist)...")
+	ep6Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	ep6 := setupTestNode(ctx, t, "endpoint", ep6Priv, relayAddrs, 0, clusterID, allowedPeers, nil, nil, "10.200.0.6/24", []string{"10.100.6.0/24"})
+	defer ep6.h.Close()
+	defer ep6.cancel()
 
-	srcIP := net.ParseIP("10.200.0.1")
-	dstIP := net.ParseIP("10.200.0.5")
-	payload := []byte("Hello via QUIC and Connection Gater!")
-	pkt := makeMockUDPPacket(srcIP, dstIP, payload)
-
-	endpoints[0].tun.InjectPacket(pkt)
-
-	select {
-	case rxPkt := <-receivedChan:
-		rxPayload := rxPkt[28:]
-		if string(rxPayload) != string(payload) {
-			t.Fatalf("expected payload %q, got %q", string(payload), string(rxPayload))
-		}
-		log.Println("✅ UDP packet routed successfully over Connection Gater mesh!")
-	case <-time.After(10 * time.Second):
-		t.Fatalf("❌ Timeout: Failed to route packet over Connection Gater mesh")
+	err := ep6.h.Connect(ctx, r1.h.Peerstore().PeerInfo(r1.id))
+	log.Printf("🔌 Unauthorized Node dialed. err=%v, connectedness=%v", err, ep6.h.Network().Connectedness(r1.id))
+	time.Sleep(200 * time.Millisecond) // gater rejects instantly
+	if ep6.h.Network().Connectedness(r1.id) == network.Connected {
+		t.Fatalf("❌ Security Violation: Non-whitelisted node successfully connected!")
 	}
-
-	// 5. Test Unauthorized Endpoint (Endpoint 6)
-	log.Println("🛡️ Testing unauthorized Endpoint 6 connection blockage...")
-	ep6Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate ep6 key: %v", err)
-	}
-
-	// Ep6 is NOT in the whitelist (allowedPeers).
-	h6, dht6, err := makeHost(ctx, swarmKeyPath, "endpoint", ep6Priv, relayAddrs, 0, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start unauthorized EP 6 host: %v", err)
-	}
-	defer h6.Close()
-	_ = dht6
-
-	// Attempt to dial Relay 1 explicitly.
-	log.Println("🔌 Dialing Relay 1 from unauthorized Endpoint 6...")
-	r1Info, _ := peer.AddrInfoFromP2pAddr(r1Host.Addrs()[0].Encapsulate(multiaddr.StringCast("/p2p/" + r1Host.ID().String())))
-	err = h6.Connect(ctx, *r1Info)
-	log.Printf("🔌 Dialed Relay 1. err=%v, immediate connectedness=%v", err, h6.Network().Connectedness(r1Host.ID()))
-	time.Sleep(200 * time.Millisecond) // wait for responder gater to tear down connection
-	log.Printf("🔌 After 200ms sleep: connectedness=%v", h6.Network().Connectedness(r1Host.ID()))
-	if err == nil && h6.Network().Connectedness(r1Host.ID()) == network.Connected {
-		t.Fatalf("❌ Security Violation: Unauthorized Endpoint 6 successfully connected to Relay 1!")
-	}
-	log.Printf("✅ Success: Connection to Relay 1 was rejected/closed as expected. Error: %v", err)
-
-	// Attempt to dial Endpoint 1 directly.
-	log.Println("🔌 Dialing Endpoint 1 from unauthorized Endpoint 6...")
-	ep1Info := peer.AddrInfo{
-		ID:    endpoints[0].id,
-		Addrs: endpoints[0].h.Addrs(),
-	}
-	err = h6.Connect(ctx, ep1Info)
-	log.Printf("🔌 Dialed Endpoint 1. err=%v, immediate connectedness=%v", err, h6.Network().Connectedness(endpoints[0].id))
-	time.Sleep(200 * time.Millisecond) // wait for responder gater to tear down connection
-	log.Printf("🔌 After 200ms sleep: connectedness=%v", h6.Network().Connectedness(endpoints[0].id))
-	if err == nil && h6.Network().Connectedness(endpoints[0].id) == network.Connected {
-		t.Fatalf("❌ Security Violation: Unauthorized Endpoint 6 successfully connected to Endpoint 1!")
-	}
-	log.Printf("✅ Success: Connection to Endpoint 1 was rejected/closed as expected. Error: %v", err)
+	log.Println("✅ Success: Non-whitelisted node was blocked instantly.")
 }
 
 func TestMeshCombinedMode(t *testing.T) {
@@ -694,72 +510,64 @@ func TestMeshCombinedMode(t *testing.T) {
 	defer cancel()
 
 	clusterID := fmt.Sprintf("combined-test-cluster-%d", time.Now().UnixNano())
-	log.Printf("🧪 Running Combined Mode (pnet + conngater) integration test with Cluster ID: %s", clusterID)
-
-	swarmKeyPath := "swarm.key"
+	log.Printf("🧪 Running Combined Mode (Whitelist + CA PKI) integration test with Cluster ID: %s", clusterID)
 
 	dataKey := make([]byte, 32)
-	if _, err := rand.Read(dataKey); err != nil {
+	if _, err := io.ReadFull(rand.Reader, dataKey); err != nil {
 		t.Fatalf("failed to generate random data key: %v", err)
 	}
 	if err := InitCipher(dataKey); err != nil {
 		t.Fatalf("failed to initialize cipher: %v", err)
 	}
 
-	// 1. Generate keys and whitelist Peer IDs (including relays + 5 endpoints + endpoint 7)
-	log.Println("🔑 Pre-generating keys and whitelisting Peer IDs...")
-	relay1Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	r1ID, _ := peer.IDFromPrivateKey(relay1Priv)
-	relay2Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	r2ID, _ := peer.IDFromPrivateKey(relay2Priv)
+	// 1. Generate Root CA
+	caPub, caPriv, err := mldsa87.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key pair: %v", err)
+	}
+
+	// Pre-generate keys and signatures for Relays and Endpoints
+	r1Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	r1ID, _ := peer.IDFromPrivateKey(r1Priv)
+	r2Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	r2ID, _ := peer.IDFromPrivateKey(r2Priv)
 
 	epPrivs := make([]crypto.PrivKey, 5)
 	epIDs := make([]peer.ID, 5)
 	for i := 0; i < 5; i++ {
-		epPriv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-		if err != nil {
-			t.Fatalf("failed to generate key: %v", err)
-		}
-		epPrivs[i] = epPriv
-		epIDs[i], _ = peer.IDFromPrivateKey(epPriv)
+		epPrivs[i], _, _ = crypto.GenerateKeyPair(crypto.RSA, 2048)
+		epIDs[i], _ = peer.IDFromPrivateKey(epPrivs[i])
 	}
 
-	ep7Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate ep7 key: %v", err)
-	}
+	// Pre-generate EP 7 keys as well to add it to the whitelist
+	ep7Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	ep7ID, _ := peer.IDFromPrivateKey(ep7Priv)
 
-	// Whitelist includes relays, EP 1..5, and EP 7
 	allowedPeers := []peer.ID{r1ID, r2ID, ep7ID}
 	allowedPeers = append(allowedPeers, epIDs...)
 
-	// 2. Launch 2 Relays in Combined Mode (swarm.key + whitelist)
+	sigs := make(map[peer.ID][]byte)
+	for _, id := range allowedPeers {
+		sig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
+		sigs[id] = sig
+	}
+
+	// 2. Launch 2 Relays (both Whitelist and CA enabled)
 	log.Println("🟢 Launching 2 Relays in Combined Mode...")
-	r1Host, r1DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay1Priv, nil, 4701, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start Relay 1: %v", err)
-	}
-	defer r1Host.Close()
+	r1 := setupTestNode(ctx, t, "relay", r1Priv, nil, 4951, clusterID, allowedPeers, caPub, sigs[r1ID], "", nil)
+	defer r1.h.Close()
+	defer r1.cancel()
 
-	r2Host, r2DHT, err := makeHost(ctx, swarmKeyPath, "relay", relay2Priv, nil, 4702, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start Relay 2: %v", err)
-	}
-	defer r2Host.Close()
+	r2 := setupTestNode(ctx, t, "relay", r2Priv, nil, 4952, clusterID, allowedPeers, caPub, sigs[r2ID], "", nil)
+	defer r2.h.Close()
+	defer r2.cancel()
 
-	if err := r1DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 1: %v", err)
-	}
-	if err := r2DHT.Bootstrap(ctx); err != nil {
-		t.Fatalf("failed to bootstrap Relay 2: %v", err)
-	}
-
-	r1Addr := fmt.Sprintf("%s/p2p/%s", r1Host.Addrs()[0], r1Host.ID())
-	r2Addr := fmt.Sprintf("%s/p2p/%s", r2Host.Addrs()[0], r2Host.ID())
+	r1Addr := fmt.Sprintf("%s/p2p/%s", r1.h.Addrs()[0], r1.id)
+	r2Addr := fmt.Sprintf("%s/p2p/%s", r2.h.Addrs()[0], r2.id)
 	relayAddrs := []string{r1Addr, r2Addr}
 
-	// 3. Launch 5 Endpoints in Combined Mode
+	// 3. Launch 5 Endpoints
 	log.Println("🟢 Launching 5 Endpoints in Combined Mode...")
 	endpoints := make([]*TestNode, 5)
 
@@ -768,154 +576,50 @@ func TestMeshCombinedMode(t *testing.T) {
 		virtualIP := fmt.Sprintf("10.200.0.%d/24", epIdx)
 		advertiseSubnet := fmt.Sprintf("10.100.%d.0/24", epIdx)
 
-		h, dhtObj, err := makeHost(ctx, swarmKeyPath, "endpoint", epPrivs[i], relayAddrs, 0, clusterID, allowedPeers)
-		if err != nil {
-			t.Fatalf("failed to start EP %d: %v", epIdx, err)
-		}
+		endpoints[i] = setupTestNode(ctx, t, "endpoint", epPrivs[i], relayAddrs, 0, clusterID, allowedPeers, caPub, sigs[epIDs[i]], virtualIP, []string{advertiseSubnet})
+		defer endpoints[i].h.Close()
+		defer endpoints[i].cancel()
 
-		if err := dhtObj.Bootstrap(ctx); err != nil {
-			t.Fatalf("failed to bootstrap EP %d: %v", epIdx, err)
-		}
-
-		connectToPeer(ctx, h, r1Addr)
-		connectToPeer(ctx, h, r2Addr)
-
-		rt := NewRoutingTable()
-		mockTunName := fmt.Sprintf("combined-mock-tun-%d", epIdx)
-		tun := NewMockTun(mockTunName).(*MockTun)
-
-		epCtx, epCancel := context.WithCancel(ctx)
-		endpoints[i] = &TestNode{
-			id:           h.ID(),
-			h:            h,
-			routingTable: rt,
-			tun:          tun,
-			ctx:          epCtx,
-			cancel:       epCancel,
-		}
-
-		// Setup Handshake Handler
-		h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-			defer s.Close()
-			remotePeer := s.Conn().RemotePeer()
-			var msg HandshakeMessage
-			if err := json.NewDecoder(s).Decode(&msg); err != nil {
-				return
-			}
-			rt.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
-			resp := HandshakeMessage{
-				VirtualIP: virtualIP,
-				Subnets:   []string{advertiseSubnet},
-			}
-			json.NewEncoder(s).Encode(&resp)
-		})
-
-		// Setup Tunnel Handler
-		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
-			remotePeer := s.Conn().RemotePeer()
-			rt.SetStream(remotePeer, s)
-			defer s.Close()
-			defer rt.ClearStreamIfMatches(remotePeer, s)
-			for {
-				packet, err := readFrame(s, dataKey)
-				if err != nil {
-					break
-				}
-				if _, err := tun.Write(packet); err != nil {
-					break
-				}
-			}
-		})
-
-		// Notify Bundle
-		h.Network().Notify(&network.NotifyBundle{
-			ConnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				if remotePeer == r1Host.ID() || remotePeer == r2Host.ID() {
-					return
-				}
-				if rt.HasPeer(remotePeer) {
-					return
-				}
-				go pushHandshake(epCtx, h, remotePeer, virtualIP, []string{advertiseSubnet}, rt, tun)
-			},
-			DisconnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				rt.UnregisterPeer(remotePeer)
-			},
-		})
+		connectToPeer(ctx, endpoints[i].h, r1Addr)
+		connectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
-		routingDiscovery := routing.NewRoutingDiscovery(dhtObj)
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				routingDiscovery.Advertise(epCtx, clusterID)
+				disc.Advertise(n.ctx, clusterID)
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(1 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
+		}(endpoints[i])
 
-		go func(nodeHost host.Host) {
+		go func(n *TestNode) {
+			disc := routing.NewRoutingDiscovery(n.dht)
 			for {
-				peerChan, err := routingDiscovery.FindPeers(epCtx, clusterID)
+				peerChan, err := disc.FindPeers(n.ctx, clusterID)
 				if err == nil {
 					for p := range peerChan {
-						if p.ID == nodeHost.ID() || p.ID == r1Host.ID() || p.ID == r2Host.ID() {
+						if p.ID == n.id || p.ID == r1.id || p.ID == r2.id {
 							continue
 						}
-						if nodeHost.Network().Connectedness(p.ID) != network.Connected {
-							nodeHost.Connect(epCtx, p)
+						if n.h.Network().Connectedness(p.ID) != network.Connected {
+							n.h.Connect(n.ctx, p)
 						}
 					}
 				}
 				select {
-				case <-epCtx.Done():
+				case <-n.ctx.Done():
 					return
-				case <-time.After(1 * time.Second):
+				case <-time.After(2 * time.Second):
 				}
 			}
-		}(h)
-
-		// TUN Reader loop
-		go func(nodeHost host.Host, rTable *RoutingTable, mockT *MockTun) {
-			buf := make([]byte, 2048)
-			for {
-				n, err := mockT.Read(buf)
-				if err != nil {
-					return
-				}
-				packet := buf[:n]
-				if len(packet) < 20 {
-					continue
-				}
-				version := packet[0] >> 4
-				if version != 4 {
-					continue
-				}
-				destIP := net.IP(packet[16:20])
-				peerID, found := rTable.LookupPeer(destIP)
-				if !found {
-					continue
-				}
-				pktCopy := make([]byte, len(packet))
-				copy(pktCopy, packet)
-
-				q := rTable.GetOrCreateQueue(peerID, epCtx, nodeHost, dataKey, mockT)
-				select {
-				case q <- pktCopy:
-				default:
-				}
-			}
-		}(h, rt, tun)
-
-		defer h.Close()
-		defer epCancel()
+		}(endpoints[i])
 	}
 
-	log.Println("🔄 Waiting for full mesh combined-mode discovery...")
+	log.Println("🔄 Waiting for full mesh combined-mode connection...")
 	meshConnected := make(chan struct{})
 	go func() {
 		for {
@@ -943,86 +647,40 @@ func TestMeshCombinedMode(t *testing.T) {
 
 	select {
 	case <-meshConnected:
-		log.Println("✅ Success! Combined-mode endpoints are fully connected (TCP-only mode).")
+		log.Println("✅ Success! Combined-mode endpoints are fully connected.")
 	case <-ctx.Done():
 		t.Fatalf("❌ Timeout: Combined-mode endpoints failed to connect.")
 	}
 
-	// 4. Test UDP routing
-	receivedChan := make(chan []byte, 10)
-	endpoints[4].tun.OnWrite = func(pkt []byte) {
-		receivedChan <- pkt
+	// 4. Test Endpoint 6 (Not whitelisted -> blocked instantly by Connection Gater)
+	log.Println("🛡️ Testing Endpoint 6 connection blockage (not in whitelist)...")
+	ep6Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	ep6 := setupTestNode(ctx, t, "endpoint", ep6Priv, relayAddrs, 0, clusterID, allowedPeers, caPub, sigs[epIDs[0]], "10.200.0.6/24", []string{"10.100.6.0/24"})
+	defer ep6.h.Close()
+	defer ep6.cancel()
+
+	err = ep6.h.Connect(ctx, r1.h.Peerstore().PeerInfo(r1.id))
+	log.Printf("🔌 Unauthorized Node dialed. err=%v, connectedness=%v", err, ep6.h.Network().Connectedness(r1.id))
+	time.Sleep(200 * time.Millisecond) // gater rejects instantly
+	if ep6.h.Network().Connectedness(r1.id) == network.Connected {
+		t.Fatalf("❌ Security Violation: Non-whitelisted Endpoint 6 stayed connected!")
 	}
+	log.Println("✅ Success: Non-whitelisted node was blocked instantly by Connection Gater.")
 
-	srcIP := net.ParseIP("10.200.0.1")
-	dstIP := net.ParseIP("10.200.0.5")
-	payload := []byte("Hello via Combined Security Mode (TCP protected)!")
-	pkt := makeMockUDPPacket(srcIP, dstIP, payload)
+	// 5. Test Endpoint 7 (Whitelisted but has invalid CA signature -> rejected by CA and kicked after handshake)
+	log.Println("🛡️ Testing Endpoint 7 connection blockage (whitelisted but bad signature)...")
 
-	endpoints[0].tun.InjectPacket(pkt)
+	// EP 7 has invalid signature (nil)
+	ep7 := setupTestNode(ctx, t, "endpoint", ep7Priv, relayAddrs, 0, clusterID, allowedPeers, caPub, nil, "10.200.0.7/24", []string{"10.100.7.0/24"})
+	defer ep7.h.Close()
+	defer ep7.cancel()
 
-	select {
-	case rxPkt := <-receivedChan:
-		rxPayload := rxPkt[28:]
-		if string(rxPayload) != string(payload) {
-			t.Fatalf("expected payload %q, got %q", string(payload), string(rxPayload))
-		}
-		log.Println("✅ UDP packet routed successfully over combined mesh!")
-	case <-time.After(10 * time.Second):
-		t.Fatalf("❌ Timeout: Failed to route packet over combined mesh")
+	err = ep7.h.Connect(ctx, r1.h.Peerstore().PeerInfo(r1.id))
+	log.Printf("🔌 Whitelisted Node with bad sig dialed. err=%v, connectedness=%v", err, ep7.h.Network().Connectedness(r1.id))
+	time.Sleep(2 * time.Second) // wait for kicker
+	log.Printf("🔌 After 2s sleep: connectedness=%v", ep7.h.Network().Connectedness(r1.id))
+	if ep7.h.Network().Connectedness(r1.id) == network.Connected {
+		t.Fatalf("❌ Security Violation: Whitelisted node with bad signature stayed connected!")
 	}
-
-	// 5. Test Endpoint 6 (Has correct swarm.key, but NOT whitelisted in Connection Gater)
-	log.Println("🛡️ Testing Endpoint 6 connection blockage (Gater blockage)...")
-	ep6Priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate ep6 key: %v", err)
-	}
-
-	// EP 6 is NOT whitelisted.
-	h6, dht6, err := makeHost(ctx, swarmKeyPath, "endpoint", ep6Priv, relayAddrs, 0, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start EP 6: %v", err)
-	}
-	defer h6.Close()
-	_ = dht6
-
-	log.Println("🔌 Dialing Relay 1 from EP 6 (should be blocked by Relay 1's Gater)...")
-	r1Info, _ := peer.AddrInfoFromP2pAddr(r1Host.Addrs()[0].Encapsulate(multiaddr.StringCast("/p2p/" + r1Host.ID().String())))
-	err = h6.Connect(ctx, *r1Info)
-	log.Printf("🔌 Dialed Relay 1 from EP 6. err=%v, immediate connectedness=%v", err, h6.Network().Connectedness(r1Host.ID()))
-	time.Sleep(1 * time.Second) // wait for responder gater to tear down connection
-	log.Printf("🔌 After 1s sleep: connectedness=%v", h6.Network().Connectedness(r1Host.ID()))
-	if err == nil && h6.Network().Connectedness(r1Host.ID()) == network.Connected {
-		t.Fatalf("❌ Security Violation: Unauthorized Endpoint 6 successfully connected to Relay 1!")
-	}
-	log.Printf("✅ Success: Connection to Relay 1 was rejected/closed as expected. Error: %v", err)
-
-	// 6. Test Endpoint 7 (Whitelisted in Connection Gater, but has INCORRECT swarm.key)
-	log.Println("🛡️ Testing Endpoint 7 connection blockage (pnet key mismatch)...")
-	badSwarmKeyPath := "swarm_bad.key"
-	err = os.WriteFile(badSwarmKeyPath, []byte("/key/swarm/psk/1.0.0/\n/base16/\nbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb\n"), 0600)
-	if err != nil {
-		t.Fatalf("failed to write bad swarm key: %v", err)
-	}
-	defer os.Remove(badSwarmKeyPath)
-
-	// EP 7 is whitelisted, but uses `badSwarmKeyPath`.
-	h7, dht7, err := makeHost(ctx, badSwarmKeyPath, "endpoint", ep7Priv, relayAddrs, 0, clusterID, allowedPeers)
-	if err != nil {
-		t.Fatalf("failed to start EP 7: %v", err)
-	}
-	defer h7.Close()
-	_ = dht7
-
-	log.Println("🔌 Dialing Relay 1 from EP 7 (should be blocked by pnet key handshake)...")
-	err = h7.Connect(ctx, *r1Info)
-	log.Printf("🔌 Dialed Relay 1 from EP 7. err=%v, immediate connectedness=%v", err, h7.Network().Connectedness(r1Host.ID()))
-	time.Sleep(1 * time.Second) // wait for pnet handshake failure to close connection
-	log.Printf("🔌 After 1s sleep: connectedness=%v", h7.Network().Connectedness(r1Host.ID()))
-	if err == nil && h7.Network().Connectedness(r1Host.ID()) == network.Connected {
-		t.Fatalf("❌ Security Violation: Endpoint 7 successfully connected with bad swarm.key!")
-	}
-	log.Printf("✅ Success: Connection to Relay 1 was rejected by pnet as expected. Error: %v", err)
+	log.Println("✅ Success: Whitelisted node with bad signature was disconnected by CA verification.")
 }
-

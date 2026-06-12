@@ -3,9 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
@@ -40,9 +42,8 @@ func getEnvBool(key string, defaultValue bool) bool {
 
 func main() {
 	// --- CLI Flags & Environment Overrides ---
-	modeFlag := flag.String("mode", getEnv("P2P_VPN_MODE", "endpoint"), "Operational mode: 'relay' or 'endpoint'")
+	modeFlag := flag.String("mode", getEnv("P2P_VPN_MODE", "endpoint"), "Operational mode: 'relay', 'endpoint', 'ca-keygen', 'ca-sign', or 'ca-verify'")
 	portFlag := flag.Int("port", 0, "Listening port (Default: 4001 for relay, 0/ephemeral for endpoint)")
-	secretKeyPathFlag := flag.String("secret", getEnv("P2P_VPN_SECRET", "swarm.key"), "Path to the swarm key (PSK) file")
 	identityPathFlag := flag.String("identity", getEnv("P2P_VPN_IDENTITY", ""), "Path to identity file (Defaults: identity-<mode>.key)")
 	clusterIDFlag := flag.String("cluster", getEnv("P2P_VPN_CLUSTER", "my-k8s-cluster"), "The cluster ID string for rendezvous")
 	relayAddrsFlag := flag.String("relay", getEnv("P2P_VPN_RELAY", ""), "Comma-separated multiaddrs of bootstrap relays")
@@ -51,7 +52,140 @@ func main() {
 	advertiseFlag := flag.String("advertise", getEnv("P2P_VPN_ADVERTISE", ""), "Comma-separated subnets to advertise (e.g. 10.100.1.0/24)")
 	dryRunFlag := flag.Bool("dry-run", getEnvBool("P2P_VPN_DRY_RUN", false), "Run with dry-run/mock TUN interface")
 	allowedPeersFlag := flag.String("allowed-peers", getEnv("P2P_VPN_ALLOWED_PEERS", ""), "Path to file containing allowed Peer IDs (one per line) for Connection Gater")
+	caKeyPathFlag := flag.String("ca-key", getEnv("P2P_VPN_CA_KEY", ""), "Path to the PEM-encoded CA public key file")
+	nodeSigPathFlag := flag.String("node-sig", getEnv("P2P_VPN_NODE_SIG", ""), "Path to this node's PEM-encoded signature file")
+	caKeyPrivPathFlag := flag.String("ca-key-priv", "", "Path to the CA's PEM-encoded private key file (for ca-sign mode)")
+	peerIDFlag := flag.String("peer", "", "Target Peer ID to sign (for ca-sign mode)")
+	sigPathFlag := flag.String("sig", "", "Path to the signature file to verify (for ca-verify mode)")
 	flag.Parse()
+
+	// --- Standalone PKI / CA Utility Modes ---
+	if *modeFlag == "ca-keygen" {
+		log.Println("🔑 Generating ML-DSA-87 CA key pair...")
+		pk, sk, err := mldsa87.GenerateKey(rand.Reader)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to generate CA key: %v", err)
+		}
+
+		pkPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 PUBLIC KEY",
+			Bytes: pk.Bytes(),
+		})
+		skPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 PRIVATE KEY",
+			Bytes: sk.Bytes(),
+		})
+
+		if err := os.WriteFile("ca.pub", pkPEM, 0644); err != nil {
+			log.Fatalf("❌ FATAL: Failed to write ca.pub: %v", err)
+		}
+		if err := os.WriteFile("ca.key", skPEM, 0600); err != nil {
+			log.Fatalf("❌ FATAL: Failed to write ca.key: %v", err)
+		}
+
+		log.Println("✅ CA Keys successfully written to ca.pub and ca.key!")
+		return
+	}
+
+	if *modeFlag == "ca-sign" {
+		if *caKeyPrivPathFlag == "" {
+			log.Fatalf("❌ FATAL: ca-sign mode requires the CA private key path (-ca-key-priv)")
+		}
+		if *peerIDFlag == "" {
+			log.Fatalf("❌ FATAL: ca-sign mode requires the target Peer ID to sign (-peer)")
+		}
+
+		targetPeerID, err := peer.Decode(*peerIDFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Invalid target Peer ID: %v", err)
+		}
+
+		skPEM, err := os.ReadFile(*caKeyPrivPathFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to read CA private key file: %v", err)
+		}
+		block, _ := pem.Decode(skPEM)
+		var skBytes []byte
+		if block == nil || block.Type != "ML-DSA-87 PRIVATE KEY" {
+			str := strings.TrimSpace(string(skPEM))
+			if hb, err := hex.DecodeString(str); err == nil {
+				skBytes = hb
+			} else {
+				skBytes = skPEM
+			}
+		} else {
+			skBytes = block.Bytes
+		}
+
+		sk := new(mldsa87.PrivateKey)
+		if err := sk.UnmarshalBinary(skBytes); err != nil {
+			log.Fatalf("❌ FATAL: Invalid CA private key format: %v", err)
+		}
+
+		msg := []byte(targetPeerID.String())
+		ctxBytes := []byte("p2p-vpn-auth")
+		sigBytes := make([]byte, mldsa87.SignatureSize)
+		err = mldsa87.SignTo(sk, msg, ctxBytes, true, sigBytes)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to sign Peer ID: %v", err)
+		}
+
+		sigPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 SIGNATURE",
+			Bytes: sigBytes,
+		})
+
+		sigFileName := fmt.Sprintf("%s.sig", targetPeerID.String())
+		if err := os.WriteFile(sigFileName, sigPEM, 0644); err == nil {
+			log.Printf("✅ Signature successfully written to %s", sigFileName)
+		}
+		fmt.Println(string(sigPEM))
+		return
+	}
+
+	if *modeFlag == "ca-verify" {
+		if *caKeyPathFlag == "" {
+			log.Fatalf("❌ FATAL: ca-verify mode requires the CA public key path (-ca-key)")
+		}
+		if *peerIDFlag == "" {
+			log.Fatalf("❌ FATAL: ca-verify mode requires the target Peer ID (-peer)")
+		}
+		if *sigPathFlag == "" {
+			log.Fatalf("❌ FATAL: ca-verify mode requires the signature file path (-sig)")
+		}
+
+		pkBytes, err := readPublicKeyBytes(*caKeyPathFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to read/parse CA public key: %v", err)
+		}
+		pk := new(mldsa87.PublicKey)
+		if err := pk.UnmarshalBinary(pkBytes); err != nil {
+			log.Fatalf("❌ FATAL: Invalid CA public key format: %v", err)
+		}
+
+		sigPEM, err := os.ReadFile(*sigPathFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to read signature file: %v", err)
+		}
+		sigBytes, err := decodeSignaturePEM(sigPEM)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to decode signature: %v", err)
+		}
+
+		targetPeerID, err := peer.Decode(*peerIDFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Invalid Peer ID: %v", err)
+		}
+
+		valid := mldsa87.Verify(pk, []byte(targetPeerID.String()), []byte("p2p-vpn-auth"), sigBytes)
+		if valid {
+			log.Println("✅ Success: Signature is VALID for this Peer ID!")
+		} else {
+			log.Println("❌ FAILED: Signature is INVALID for this Peer ID!")
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Parse PORT env fallback if flag was 0
 	finalPort := *portFlag
@@ -73,6 +207,38 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Load CA Public Key if configured
+	if *caKeyPathFlag != "" {
+		pkBytes, err := readPublicKeyBytes(*caKeyPathFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to read CA public key from %q: %v", *caKeyPathFlag, err)
+		}
+		pubKey := new(mldsa87.PublicKey)
+		if err := pubKey.UnmarshalBinary(pkBytes); err != nil {
+			log.Fatalf("❌ FATAL: Invalid CA public key format: %v", err)
+		}
+		CAPubKey = pubKey
+		log.Println("🛡️ PKI Authentication ENABLED using CA Public Key")
+	}
+
+	// Load Node Signature if configured
+	if *nodeSigPathFlag != "" {
+		sigPEM, err := os.ReadFile(*nodeSigPathFlag)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to read node signature file from %q: %v", *nodeSigPathFlag, err)
+		}
+		sigBytes, err := decodeSignaturePEM(sigPEM)
+		if err != nil || len(sigBytes) == 0 {
+			log.Fatalf("❌ FATAL: Failed to decode node signature: %v", err)
+		}
+		NodeSignature = sigBytes
+		log.Println("🛡️ Node Signature loaded for CA verification")
+	}
+
+	if CAPubKey != nil && len(NodeSignature) == 0 {
+		log.Println("⚠️ WARNING: CA public key is set, but no node signature (-node-sig) is configured. This node will be unable to authenticate to other CA-enforcing peers.")
+	}
 
 	// 1. Load Data Encryption Key for Endpoints
 	var dataKey []byte
@@ -203,7 +369,7 @@ func main() {
 		}
 	}
 
-	h, dhtObj, err := makeHost(ctx, *secretKeyPathFlag, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
+	h, dhtObj, err := makeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to initialize libp2p host: %v", err)
 	}
@@ -237,58 +403,19 @@ func main() {
 		log.Fatalf("❌ DHT Bootstrap failed: %v", err)
 	}
 
-	// 8. VPN Handshake and Stream Handlers
+	// 8. VPN Handshake and Connection Handlers (Active on both Relay and Endpoint)
+	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
+		localVIP := ""
+		var localSubs []string
+		if *modeFlag == "endpoint" {
+			localVIP = *tunIPFlag
+			localSubs = advertisedSubnets
+		}
+		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+	})
+
 	if *modeFlag == "endpoint" {
-		// Handshake Stream Handler: Receives peer subnets, configures local routing, and responds with local subnets
-		h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-			defer s.Close()
-			remotePeer := s.Conn().RemotePeer()
-			log.Printf("🤝 Incoming handshake stream from %s", remotePeer)
-
-			var msg HandshakeMessage
-			if err := json.NewDecoder(s).Decode(&msg); err != nil {
-				log.Printf("⚠️ Failed to parse handshake message from %s: %v", remotePeer, err)
-				return
-			}
-
-			log.Printf("📝 Handshake: Peer %s reports Virtual IP: %s, Subnets: %v", remotePeer, msg.VirtualIP, msg.Subnets)
-
-			newSubnets, oldSubnets := routingTable.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
-
-			// Clean up obsolete routes
-			newSet := make(map[string]bool)
-			for _, s := range newSubnets {
-				newSet[s] = true
-			}
-			for _, s := range oldSubnets {
-				if !newSet[s] {
-					log.Printf("🗑️ Removing obsolete route for peer %s: %s", remotePeer, s)
-					tunIfce.DeleteRoute(s)
-				}
-			}
-
-			// Add new routes
-			for _, s := range newSubnets {
-				log.Printf("➕ Adding route for peer %s: %s", remotePeer, s)
-				if err := tunIfce.AddRoute(s); err != nil {
-					log.Printf("⚠️ Failed to configure route %s: %v", s, err)
-				}
-			}
-
-			// Respond back with our own routing information over the same stream
-			resp := HandshakeMessage{
-				VirtualIP: *tunIPFlag,
-				Subnets:   advertisedSubnets,
-			}
-			encoder := json.NewEncoder(s)
-			if err := encoder.Encode(&resp); err != nil {
-				log.Printf("⚠️ Failed to encode response handshake to %s: %v", remotePeer, err)
-				return
-			}
-			log.Printf("✅ Bidirectional handshake response successfully sent to %s", remotePeer)
-		})
-
-		// Tunnel Data Stream Handler: Decrypts frames and writes packets to TUN
+		// Tunnel Data Stream Handler: Decrypts frames and writes packets to TUN (Endpoint Only)
 		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
 			remotePeer := s.Conn().RemotePeer()
 			log.Printf("📥 Incoming tunnel data stream established from %s", remotePeer)
@@ -313,32 +440,40 @@ func main() {
 			}
 			log.Printf("❌ Incoming tunnel data stream closed from %s", remotePeer)
 		})
-
-		// Network notification callbacks to handle connection lifecycle
-		h.Network().Notify(&network.NotifyBundle{
-			ConnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				log.Printf("🔌 Connected to peer: %s", remotePeer)
-				if routingTable.HasPeer(remotePeer) {
-					log.Printf("🤝 Peer %s already registered in routing table. Skipping handshake push.", remotePeer)
-					return
-				}
-				// Initiate routing info handshake
-				go pushHandshake(ctx, h, remotePeer, *tunIPFlag, advertisedSubnets, routingTable, tunIfce)
-			},
-			DisconnectedF: func(n network.Network, conn network.Conn) {
-				remotePeer := conn.RemotePeer()
-				log.Printf("❌ Disconnected from peer: %s", remotePeer)
-				virtualIP, subnets := routingTable.UnregisterPeer(remotePeer)
-				if virtualIP != "" {
-					log.Printf("🧹 Cleaning up routes for disconnected peer %s", remotePeer)
-					for _, s := range subnets {
-						tunIfce.DeleteRoute(s)
-					}
-				}
-			},
-		})
 	}
+
+	h.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, conn network.Conn) {
+			remotePeer := conn.RemotePeer()
+			log.Printf("🔌 Connected to peer: %s", remotePeer)
+			if routingTable.HasPeer(remotePeer) {
+				log.Printf("🤝 Peer %s already registered. Skipping handshake push.", remotePeer)
+				return
+			}
+			// Start the CA authentication timeout kicker if PKI is enabled
+			StartCAAuthKicker(ctx, h, routingTable, remotePeer, CAPubKey)
+
+			// Initiate routing info handshake (outbound)
+			localVIP := ""
+			var localSubs []string
+			if *modeFlag == "endpoint" {
+				localVIP = *tunIPFlag
+				localSubs = advertisedSubnets
+			}
+			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+		},
+		DisconnectedF: func(n network.Network, conn network.Conn) {
+			remotePeer := conn.RemotePeer()
+			log.Printf("❌ Disconnected from peer: %s", remotePeer)
+			virtualIP, subnets := routingTable.UnregisterPeer(remotePeer)
+			if virtualIP != "" && tunIfce != nil {
+				log.Printf("🧹 Cleaning up routes for disconnected peer %s", remotePeer)
+				for _, s := range subnets {
+					tunIfce.DeleteRoute(s)
+				}
+			}
+		},
+	})
 
 	// 9. Discovery Loop
 	routingDiscovery := routing.NewRoutingDiscovery(dhtObj)
@@ -546,3 +681,21 @@ func makeMockUDPPacket(srcIP, destIP net.IP, payload []byte) []byte {
 
 	return pkt
 }
+
+func readPublicKeyBytes(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "ML-DSA-87 PUBLIC KEY" {
+		// Fallback to raw hex
+		str := strings.TrimSpace(string(data))
+		if hb, err := hex.DecodeString(str); err == nil {
+			return hb, nil
+		}
+		return data, nil
+	}
+	return block.Bytes, nil
+}
+
