@@ -23,6 +23,9 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -45,7 +48,8 @@ jobs:
 
       - name: Tag and Push Docker Images
         run: |
-          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/p2p-vpn"
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/${OWNER_LOWER}/p2p-vpn"
           
           # Helper function to tag and push an arch image
           push_arch_images() {
@@ -111,4 +115,5 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login -u ${{ github.actor }} --password-stdin ghcr.io
           
           # Push the Helm chart package to GHCR
-          helm push "p2p-vpn-$CHART_VERSION.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts"
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push "p2p-vpn-$CHART_VERSION.tgz" "oci://ghcr.io/${OWNER_LOWER}/charts"
