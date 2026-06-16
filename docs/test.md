@@ -1,27 +1,52 @@
 scp -i ~/.ssh/aws-rsa-again.pem p2p-vpn.linux-amd64 ec2-user@98.83.233.254:~/ 
 
-./p2p-vpn -mode relay -port 4001 -secret swarm.key -cluster my-vpn-cluster
+./p2p-vpn -mode ca-keygen
+openssl rand -hex 32 > data.key
 
-/ip4/172.31.34.205/tcp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9
+# Print Relay Peer ID:
+./p2p-vpn -mode relay -identity identity-relay.key
+# Print Endpoint A Peer ID:
+./p2p-vpn -mode endpoint -identity identity-a.key -dry-run
+# Print Endpoint B Peer ID:
+./p2p-vpn -mode endpoint -identity identity-b.key -dry-run
 
-/ip4/98.83.233.254/tcp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9,/ip4/98.83.233.254/udp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9
+# Sign the Relay:
+./p2p-vpn -mode ca-sign -ca-key-priv ca.key -peer <RELAY_PEER_ID>
+# Sign Endpoint A:
+./p2p-vpn -mode ca-sign -ca-key-priv ca.key -peer <ENDPOINT_A_PEER_ID>
+# Sign Endpoint B:
+./p2p-vpn -mode ca-sign -ca-key-priv ca.key -peer <ENDPOINT_B_PEER_ID>
+
+cat <<EOF > whitelist.txt
+<RELAY_PEER_ID>
+<ENDPOINT_A_PEER_ID>
+<ENDPOINT_B_PEER_ID>
+EOF
 
 
+./p2p-vpn -mode relay \
+          -port 4001 \
+          -cluster manual-test-cluster \
+          -ca-key ca.pub \
+          -node-sig identity-relay.sig
+          # -allowed-peers whitelist.txt
 
-sudo ./p2p-vpn -mode endpoint \
-               -secret swarm.key \
-               -cluster my-vpn-cluster \
-               -datakey data.key \
-               -relay "/ip4/98.83.233.254/tcp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9" \
-               -tun-ip "10.200.0.1/24" \
-               -advertise "192.168.56.0/24" \
-               -identity identity-a.key
+./p2p-vpn -mode endpoint \
+          -identity identity-a.key \
+          -cluster manual-test-cluster \
+          -datakey data.key \
+          -relay "/ip4/127.0.0.1/tcp/4001/p2p/QmSjmaXTfZ11i6bC6E8JpAckL5corg1NW3BFcQAJvFBhVE" \
+          -tun-ip "10.200.0.1/24" \
+          -advertise "10.100.1.0/24" \
+          -ca-key ca.pub \
+          -node-sig identity-a.sig
 
-sudo ./p2p-vpn -mode endpoint \
-               -secret swarm.key \
-               -cluster my-vpn-cluster \
-               -datakey data.key \
-               -relay "/ip4/127.0.0.1/tcp/4001/p2p/QmP6uJKP236XreBBQLYc7JYkqtxWLimwe2T7JrFTVQVfc9" \
-               -tun-ip "10.200.0.2/24" \
-               -advertise "172.31.34.205/24" \
-               -identity identity-b.key
+./p2p-vpn -mode endpoint \
+          -identity identity-b.key \
+          -cluster manual-test-cluster \
+          -datakey data.key \
+          -relay "/ip4/127.0.0.1/tcp/4001/p2p/QmSjmaXTfZ11i6bC6E8JpAckL5corg1NW3BFcQAJvFBhVE" \
+          -tun-ip "10.200.0.2/24" \
+          -advertise "10.100.2.0/24" \
+          -ca-key ca.pub \
+          -node-sig identity-b.sig

@@ -1,0 +1,114 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker Images via Nix
+        run: |
+          nix build .#docker-amd64
+          docker load < result
+          nix build .#docker-arm64
+          docker load < result
+
+      - name: Tag and Push Docker Images
+        run: |
+          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/p2p-vpn"
+          
+          # Helper function to tag and push an arch image
+          push_arch_images() {
+            local arch=$1
+            local tag=$2
+            docker tag "p2p-vpn:latest-$arch" "$IMAGE_NAME:$tag-$arch"
+            docker push "$IMAGE_NAME:$tag-$arch"
+          }
+          
+          # Helper function to create and push a multi-arch manifest
+          push_manifest() {
+            local tag=$1
+            docker manifest create "$IMAGE_NAME:$tag" \
+              "$IMAGE_NAME:$tag-amd64" \
+              "$IMAGE_NAME:$tag-arm64"
+            docker manifest push "$IMAGE_NAME:$tag"
+          }
+
+          # If it's a release tag
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+            push_arch_images "amd64" "$TAG"
+            push_arch_images "arm64" "$TAG"
+            push_manifest "$TAG"
+          fi
+          
+          # Always push latest and sha tag on main branch push
+          if [[ "${{ github.ref }}" == refs/heads/main ]]; then
+            push_arch_images "amd64" "latest"
+            push_arch_images "amd64" "${{ github.sha }}"
+            push_arch_images "arm64" "latest"
+            push_arch_images "arm64" "${{ github.sha }}"
+            
+            push_manifest "latest"
+            push_manifest "${{ github.sha }}"
+          fi
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.18.6'
+
+      - name: Publish Helm Chart to GHCR
+        run: |
+          CHART_VERSION="0.1.0"
+          APP_VERSION="latest"
+          
+          # If it's a tag, use the tag as version
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Remove leading 'v' if present for Helm semver
+            CHART_VERSION="${{ github.ref_name }}"
+            CHART_VERSION="${CHART_VERSION#v}"
+            APP_VERSION="${{ github.ref_name }}"
+          fi
+          
+          # Lint the chart
+          helm lint charts/p2p-vpn
+          
+          # Package the chart
+          helm package charts/p2p-vpn --version "$CHART_VERSION" --app-version "$APP_VERSION"
+          
+          # Login to Helm registry (GHCR)
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login -u ${{ github.actor }} --password-stdin ghcr.io
+          
+          # Push the Helm chart package to GHCR
+          helm push "p2p-vpn-$CHART_VERSION.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts"
