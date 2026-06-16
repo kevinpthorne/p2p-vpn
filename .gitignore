@@ -1,6 +1,6 @@
 *.key
 p2p-vpn.*
-p2p-vpn
+/p2p-vpn
 *.sig
 *.pub
 whitelist.txt

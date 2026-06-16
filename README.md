@@ -34,28 +34,60 @@ The security options are fully optional and can be layered to suit different thr
 
 ## How to Build
 
-Before compiling, fetch and resolve all required Go dependencies:
+### Using Nix (Recommended)
+This project includes a Nix flake to natively build, cross-compile, and package the application:
+- **Build the native binary** (for your current OS/architecture):
+  ```bash
+  nix build
+  ```
+  The binary will be available at `./result/bin/p2p-vpn`.
+- **Cross-compile for Windows (amd64)**:
+  ```bash
+  nix build .#windows
+  ```
+  The executable will be available at `./result/bin/p2p-vpn-windows.exe`.
+- **Build the vulnerability-free `scratch` Docker images** (via Go native cross-compiling):
+  ```bash
+  # AMD64 Image
+  nix build .#docker-amd64
+  # ARM64 Image
+  nix build .#docker-arm64
+  ```
+  These generate loaded image tarballs at `./result` containing *only* the compiled static Go binary (zero OS vulnerabilities and small footprint of ~15MB).
+
+### Standard Go Build (requires Go 1.25.5+)
+Fetch and resolve dependencies:
 ```bash
 go mod tidy
 ```
+- **Local build**:
+  ```bash
+  go build -o p2p-vpn main.go tun.go tun_darwin.go tun_linux.go tun_unsupported.go tun_windows.go
+  ```
+- **Multi-platform build** (using compile.sh):
+  ```bash
+  chmod +x compile.sh
+  ./compile.sh
+  ```
+  This generates:
+  - `p2p-vpn.darwin-arm64` (for Apple Silicon macOS)
+  - `p2p-vpn.win-amd64.exe` (for 64-bit Windows)
+  - `p2p-vpn.linux-amd64` (for 64-bit Linux)
+  - `p2p-vpn.linux-arm64` (for 64-bit ARM Linux/Docker containers)
 
-### Local Build (Current OS/Architecture)
-To compile the binary for your local machine:
+---
+
+## How to Test
+
+Unit tests run against the mock TUN interface (`MockTun`) and do not require root permissions or internet access:
 ```bash
-go build -o p2p-vpn main.go tun.go vpn.go
+go test -v ./...
 ```
 
-### Multi-Platform Build (using compile.sh)
-To compile binaries for multiple platforms (macOS, Linux, and Windows):
+When building via Nix, tests are automatically run inside the Nix build sandbox:
 ```bash
-chmod +x compile.sh
-./compile.sh
+nix build .#p2p-vpn
 ```
-This generates the following files in the project root:
-- `p2p-vpn.darwin-arm64` (for Apple Silicon macOS)
-- `p2p-vpn.win-amd64.exe` (for 64-bit Windows)
-- `p2p-vpn.linux-amd64` (for 64-bit Linux)
-- `p2p-vpn.linux-arm64` (for 64-bit ARM Linux/Docker containers)
 
 ---
 
@@ -151,6 +183,37 @@ sudo ./p2p-vpn -mode endpoint \
                -node-sig <epa-peer-id>.sig \
                -allowed-peers whitelist.txt
 ```
+
+### 4. Start Endpoints (Docker Container)
+Our Docker images are packaged using Nix from a pure `scratch` base. Run the container with the `NET_ADMIN` capability and TUN device access:
+```bash
+docker run --rm -it \
+  --cap-add=NET_ADMIN \
+  --device=/dev/net/tun:/dev/net/tun \
+  -e P2P_VPN_MODE=endpoint \
+  -e P2P_VPN_CLUSTER=my-vpn-cluster \
+  -e P2P_VPN_TUN_IP=10.200.0.1/24 \
+  -e P2P_VPN_RELAY="/ip4/1.2.3.4/tcp/4001/p2p/Qm..." \
+  ghcr.io/kevinpthorne/p2p-vpn:latest
+```
+
+### 5. Deploy on Kubernetes (using Helm)
+We package and host the Helm chart as an OCI registry artifact on GHCR.
+
+**Install the Helm Chart**:
+```bash
+helm install my-vpn oci://ghcr.io/kevinpthorne/charts/p2p-vpn --version 0.1.0 \
+  --set mode=endpoint \
+  --set cluster=my-vpn-cluster \
+  --set tunIp=10.200.0.1/24 \
+  --set relayMultiaddr="/ip4/1.2.3.4/tcp/4001/p2p/Qm..."
+```
+
+**Key Parameters in `values.yaml`**:
+- `mode`: `endpoint` or `relay`.
+- `secrets.create` / `existingSecret`: Options to feed key files (`data.key`, `identity.key`, `ca.pub`, `node.sig`, `whitelist.txt`) securely.
+- `securityContext`: Automatically configured with `privileged: true` (or `NET_ADMIN` capabilities) to allow network interface setup.
+- `tunVolume`: Mounts the host node's `/dev/net/tun` interface inside the container.
 
 ---
 

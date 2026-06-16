@@ -16,7 +16,7 @@
           pname = "p2p-vpn";
           version = "0.1.0";
           src = ./.;
-          vendorHash = "sha256-LIJgKJSLENmsIPHfz9eK6axvCYpR+TtrXek2cIa7gMM=";
+          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
           ldflags = [ "-s" "-w" ];
         };
 
@@ -27,7 +27,7 @@
           pname = "p2p-vpn";
           version = "0.1.0";
           src = ./.;
-          vendorHash = "sha256-LIJgKJSLENmsIPHfz9eK6axvCYpR+TtrXek2cIa7gMM=";
+          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
           ldflags = [ "-s" "-w" ];
           doCheck = false;
 
@@ -38,18 +38,15 @@
           };
         };
 
-        # Fetch BusyBox for Linux amd64 from the cache
-        busybox-linux-amd64 = pkgs.pkgsCross.musl64.busybox;
-
         dockerImage-amd64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
           tag = "latest-amd64";
 
+          # scratch-like image containing only the compiled static Go binary
           copyToRoot = pkgs.buildEnv {
             name = "p2p-vpn-root-amd64";
             paths = [
               p2p-vpn-linux-amd64
-              busybox-linux-amd64
             ];
             pathsToLink = [ "/bin" ];
           };
@@ -69,7 +66,7 @@
           pname = "p2p-vpn";
           version = "0.1.0";
           src = ./.;
-          vendorHash = "sha256-LIJgKJSLENmsIPHfz9eK6axvCYpR+TtrXek2cIa7gMM=";
+          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
           ldflags = [ "-s" "-w" ];
           doCheck = false;
 
@@ -80,18 +77,15 @@
           };
         };
 
-        # Fetch BusyBox for Linux arm64 from the cache
-        busybox-linux-arm64 = pkgs.pkgsCross.aarch64-multiplatform-musl.busybox;
-
         dockerImage-arm64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
           tag = "latest-arm64";
 
+          # scratch-like image containing only the compiled static Go binary
           copyToRoot = pkgs.buildEnv {
             name = "p2p-vpn-root-arm64";
             paths = [
               p2p-vpn-linux-arm64
-              busybox-linux-arm64
             ];
             pathsToLink = [ "/bin" ];
           };
@@ -104,6 +98,24 @@
           };
         };
 
+        # --- WINDOWS TARGET ---
+
+        # Build for Windows amd64 using Go's native cross-compilation capabilities
+        p2p-vpn-windows = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
+          pname = "p2p-vpn-windows";
+          version = "0.1.0";
+          src = ./.;
+          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
+          ldflags = [ "-s" "-w" ];
+          doCheck = false;
+
+          env = {
+            GOOS = "windows";
+            GOARCH = "amd64";
+            CGO_ENABLED = "0";
+          };
+        };
+
       in
       {
         packages = {
@@ -112,6 +124,7 @@
           docker-amd64 = dockerImage-amd64;
           docker-arm64 = dockerImage-arm64;
           docker = dockerImage-amd64; # default to amd64
+          windows = p2p-vpn-windows;
         };
 
         apps.default = flake-utils.lib.mkApp { drv = p2p-vpn-native; };

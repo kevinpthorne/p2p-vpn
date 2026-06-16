@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "p2p-vpn.fullname" . }}
+  labels:
+    {{- include "p2p-vpn.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "p2p-vpn.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "p2p-vpn.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: P2P_VPN_MODE
+              value: {{ .Values.mode | quote }}
+            - name: P2P_VPN_PORT
+              value: {{ .Values.port | quote }}
+            - name: P2P_VPN_CLUSTER
+              value: {{ .Values.cluster | quote }}
+            - name: P2P_VPN_DRY_RUN
+              value: {{ .Values.dryRun | quote }}
+            {{- if .Values.relayMultiaddr }}
+            - name: P2P_VPN_RELAY
+              value: {{ .Values.relayMultiaddr | quote }}
+            {{- end }}
+            {{- if .Values.tunIp }}
+            - name: P2P_VPN_TUN_IP
+              value: {{ .Values.tunIp | quote }}
+            {{- end }}
+            {{- if .Values.advertise }}
+            - name: P2P_VPN_ADVERTISE
+              value: {{ .Values.advertise | quote }}
+            {{- end }}
+            {{- if or .Values.secrets.create .Values.existingSecret }}
+            {{- if or .Values.secrets.identityKey .Values.existingSecret }}
+            - name: P2P_VPN_IDENTITY
+              value: "/etc/p2p-vpn/identity.key"
+            {{- end }}
+            {{- if or .Values.secrets.dataKey .Values.existingSecret }}
+            - name: P2P_VPN_DATAKEY
+              value: "/etc/p2p-vpn/data.key"
+            {{- end }}
+            {{- if or .Values.secrets.caPubKey .Values.existingSecret }}
+            - name: P2P_VPN_CA_KEY
+              value: "/etc/p2p-vpn/ca.pub"
+            {{- end }}
+            {{- if or .Values.secrets.nodeSig .Values.existingSecret }}
+            - name: P2P_VPN_NODE_SIG
+              value: "/etc/p2p-vpn/node.sig"
+            {{- end }}
+            {{- if or .Values.secrets.allowedPeers .Values.existingSecret }}
+            - name: P2P_VPN_ALLOWED_PEERS
+              value: "/etc/p2p-vpn/whitelist.txt"
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            {{- if or .Values.secrets.create .Values.existingSecret }}
+            - name: secrets-volume
+              mountPath: /etc/p2p-vpn
+              readOnly: true
+            {{- end }}
+            {{- if and (eq .Values.mode "endpoint") (not .Values.dryRun) }}
+            - name: tun
+              mountPath: /dev/net/tun
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        {{- if or .Values.secrets.create .Values.existingSecret }}
+        - name: secrets-volume
+          secret:
+            secretName: {{ default (include "p2p-vpn.fullname" .) .Values.existingSecret }}
+        {{- end }}
+        {{- if and (eq .Values.mode "endpoint") (not .Values.dryRun) }}
+        - name: tun
+          hostPath:
+            path: {{ .Values.tunVolume.hostPath }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

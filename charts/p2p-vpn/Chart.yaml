@@ -1,0 +1,6 @@
+apiVersion: v2
+name: p2p-vpn
+description: A Helm chart for running the peer-to-peer mesh VPN (p2p-vpn) on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "latest"

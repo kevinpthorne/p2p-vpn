@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "p2p-vpn.fullname" . }}
+  labels:
+    {{- include "p2p-vpn.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.port }}
+      targetPort: {{ .Values.port }}
+      protocol: TCP
+      name: libp2p
+  selector:
+    {{- include "p2p-vpn.selectorLabels" . | nindent 4 }}
