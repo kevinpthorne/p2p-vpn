@@ -22,21 +22,22 @@
 
         # --- AMD64 TARGET ---
 
-        # Build for Linux amd64 using Go's native cross-compilation capabilities
-        p2p-vpn-linux-amd64 = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
-          pname = "p2p-vpn";
-          version = "0.1.0";
-          src = ./.;
-          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
-          ldflags = [ "-s" "-w" ];
+        p2p-vpn-linux-amd64 = p2p-vpn-native.overrideAttrs (oldAttrs: {
+          GOOS = "linux";
+          GOARCH = "amd64";
+          CGO_ENABLED = "0";
           doCheck = false;
 
-          env = {
-            GOOS = "linux";
-            GOARCH = "amd64";
-            CGO_ENABLED = "0";
-          };
-        };
+          env = builtins.removeAttrs (oldAttrs.env or {}) [ "GOOS" "GOARCH" "CGO_ENABLED" ];
+
+          # Move the cross-compiled binary to the main bin/ directory if it was cross-compiled
+          postInstall = ''
+            if [ -d $out/bin/linux_amd64 ]; then
+              mv $out/bin/linux_amd64/p2p-vpn $out/bin/p2p-vpn
+              rmdir $out/bin/linux_amd64
+            fi
+          '';
+        });
 
         dockerImage-amd64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
@@ -62,21 +63,22 @@
 
         # --- ARM64 TARGET ---
 
-        # Build for Linux arm64 using Go's native cross-compilation capabilities
-        p2p-vpn-linux-arm64 = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
-          pname = "p2p-vpn";
-          version = "0.1.0";
-          src = ./.;
-          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
-          ldflags = [ "-s" "-w" ];
+        p2p-vpn-linux-arm64 = p2p-vpn-native.overrideAttrs (oldAttrs: {
+          GOOS = "linux";
+          GOARCH = "arm64";
+          CGO_ENABLED = "0";
           doCheck = false;
 
-          env = {
-            GOOS = "linux";
-            GOARCH = "arm64";
-            CGO_ENABLED = "0";
-          };
-        };
+          env = builtins.removeAttrs (oldAttrs.env or {}) [ "GOOS" "GOARCH" "CGO_ENABLED" ];
+
+          # Move the cross-compiled binary to the main bin/ directory if it was cross-compiled
+          postInstall = ''
+            if [ -d $out/bin/linux_arm64 ]; then
+              mv $out/bin/linux_arm64/p2p-vpn $out/bin/p2p-vpn
+              rmdir $out/bin/linux_arm64
+            fi
+          '';
+        });
 
         dockerImage-arm64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
@@ -123,6 +125,8 @@
         packages = {
           default = p2p-vpn-native;
           p2p-vpn = p2p-vpn-native;
+          p2p-vpn-linux-amd64 = p2p-vpn-linux-amd64;
+          p2p-vpn-linux-arm64 = p2p-vpn-linux-arm64;
           docker-amd64 = dockerImage-amd64;
           docker-arm64 = dockerImage-arm64;
           docker = dockerImage-amd64; # default to amd64
