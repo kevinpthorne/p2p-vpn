@@ -57,7 +57,25 @@ func main() {
 	caKeyPrivPathFlag := flag.String("ca-key-priv", "", "Path to the CA's PEM-encoded private key file (for ca-sign mode)")
 	peerIDFlag := flag.String("peer", "", "Target Peer ID to sign (for ca-sign mode)")
 	sigPathFlag := flag.String("sig", "", "Path to the signature file to verify (for ca-verify mode)")
+	printPeerIDFlag := flag.Bool("print-peer-id", false, "Print the Peer ID of the identity key and exit")
 	flag.Parse()
+
+	if *printPeerIDFlag {
+		identityPath := *identityPathFlag
+		if identityPath == "" {
+			identityPath = fmt.Sprintf("identity-%s.key", *modeFlag)
+		}
+		privKey, err := getIdentity(identityPath)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to manage identity key: %v", err)
+		}
+		pid, err := peer.IDFromPrivateKey(privKey)
+		if err != nil {
+			log.Fatalf("❌ FATAL: Failed to extract Peer ID: %v", err)
+		}
+		fmt.Println(pid.String())
+		return
+	}
 
 	// --- Standalone PKI / CA Utility Modes ---
 	if *modeFlag == "ca-keygen" {

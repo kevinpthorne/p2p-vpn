@@ -41,6 +41,7 @@
         dockerImage-amd64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
           tag = "latest-amd64";
+          architecture = "amd64";
 
           # scratch-like image containing only the compiled static Go binary
           copyToRoot = pkgs.buildEnv {
@@ -80,6 +81,7 @@
         dockerImage-arm64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
           tag = "latest-arm64";
+          architecture = "arm64";
 
           # scratch-like image containing only the compiled static Go binary
           copyToRoot = pkgs.buildEnv {
