@@ -58,7 +58,14 @@ func main() {
 	peerIDFlag := flag.String("peer", "", "Target Peer ID to sign (for ca-sign mode)")
 	sigPathFlag := flag.String("sig", "", "Path to the signature file to verify (for ca-verify mode)")
 	printPeerIDFlag := flag.Bool("print-peer-id", false, "Print the Peer ID of the identity key and exit")
+	guiFlag := flag.Bool("gui", false, "Start built-in web dashboard client interface")
+	guiPortFlag := flag.Int("gui-port", 4040, "Listening port for the built-in web dashboard")
 	flag.Parse()
+
+	if *guiFlag {
+		StartAPIServer(*guiPortFlag)
+		return
+	}
 
 	if *printPeerIDFlag {
 		identityPath := *identityPathFlag

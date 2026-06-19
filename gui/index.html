@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshFlow P2P VPN</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo-area">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" width="24" height="24">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.53c-.26-.81-1-1.4-1.9-1.4h-1v-3c0-.55-.45-1-1-1h-6v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+                    </svg>
+                </div>
+                <h2>MeshFlow</h2>
+            </div>
+            
+            <nav class="nav-links">
+                <button class="nav-btn active" data-tab="dashboard">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+                    Dashboard
+                </button>
+                <button class="nav-btn" data-tab="profiles">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                    Profiles
+                </button>
+                <button class="nav-btn" data-tab="pki">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-1 15l-4-4 1.41-1.41L11 13.17l5.59-5.59L18 9l-7 7z"/></svg>
+                    PKI / CA
+                </button>
+                <button class="nav-btn" data-tab="logs">
+                    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-5 14H4v-4h11v4zm0-5H4V9h11v4zm5 5h-4V9h4v9z"/></svg>
+                    System Logs
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="node-id-badge">
+                    <span class="label">Local Peer ID</span>
+                    <span id="local-peer-id" class="value">Not Connected</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Workspace -->
+        <main class="main-content">
+            <header class="top-bar">
+                <div class="connection-status-container">
+                    <div id="status-dot" class="status-dot disconnected"></div>
+                    <span id="status-text">Disconnected</span>
+                </div>
+                <div class="top-bar-stats">
+                    <div class="header-stat">
+                        <span class="stat-label">Active Profile</span>
+                        <span id="active-profile-name" class="stat-value">None</span>
+                    </div>
+                    <div class="header-stat">
+                        <span class="stat-label">VPN IP</span>
+                        <span id="vpn-ip-val" class="stat-value">-</span>
+                    </div>
+                    <div class="header-stat">
+                        <span class="stat-label">Uptime</span>
+                        <span id="uptime-val" class="stat-value">00:00:00</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Views -->
+            <div class="view-viewport">
+                <!-- VIEW: Dashboard -->
+                <section id="view-dashboard" class="tab-view active">
+                    <div class="dashboard-grid">
+                        <!-- Switch Card -->
+                        <div class="glass-card connect-hero">
+                            <div class="hero-info">
+                                <h3>Mesh VPN Interface</h3>
+                                <p id="connection-subtitle">Secure, encrypted P2P tunnel interface</p>
+                            </div>
+                            <div class="switch-container">
+                                <label class="main-switch">
+                                    <input type="checkbox" id="vpn-toggle">
+                                    <span class="slider"></span>
+                                </label>
+                                <span class="switch-label">CONNECT</span>
+                            </div>
+                        </div>
+
+                        <!-- Mesh Map Card -->
+                        <div class="glass-card mesh-map-card">
+                            <div class="card-header">
+                                <h3>Network Mesh Topology</h3>
+                                <span class="legend">
+                                    <span class="legend-item"><span class="dot endpoint"></span> Endpoint</span>
+                                    <span class="legend-item"><span class="dot relay"></span> Relay/Bootstrap</span>
+                                </span>
+                            </div>
+                            <div class="canvas-wrapper">
+                                <canvas id="mesh-canvas"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Traffic Stats Card -->
+                        <div class="glass-card stats-card">
+                            <h3>Performance Metrics</h3>
+                            <div class="speeds">
+                                <div class="speed-indicator download">
+                                    <span class="speed-icon">↓</span>
+                                    <div class="speed-data">
+                                        <span class="speed-title">DOWNLOAD</span>
+                                        <span id="down-speed" class="speed-val">0.0 B/s</span>
+                                    </div>
+                                </div>
+                                <div class="speed-indicator upload">
+                                    <span class="speed-icon">↑</span>
+                                    <div class="speed-data">
+                                        <span class="speed-title">UPLOAD</span>
+                                        <span id="up-speed" class="speed-val">0.0 B/s</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="speed-chart-wrapper">
+                                <canvas id="speed-chart"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Connected Peers Card -->
+                        <div class="glass-card peers-card">
+                            <h3>Connected Endpoints & Relays</h3>
+                            <div class="table-scroll">
+                                <table id="peers-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Peer ID / Name</th>
+                                            <th>Role</th>
+                                            <th>Virtual IP</th>
+                                            <th>Status</th>
+                                            <th>Latency</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="peers-list">
+                                        <tr>
+                                            <td colspan="5" class="empty-state">No connected peers. Start the VPN to join the mesh.</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VIEW: Profiles -->
+                <section id="view-profiles" class="tab-view">
+                    <div class="profiles-manager">
+                        <div class="profiles-list-panel glass-card">
+                            <div class="panel-header">
+                                <h3>Saved Profiles</h3>
+                                <button class="btn btn-primary btn-sm" id="btn-new-profile">
+                                    + Add New
+                                </button>
+                            </div>
+                            <div class="profiles-list" id="profiles-list-items">
+                                <!-- Populated dynamically -->
+                            </div>
+                        </div>
+
+                        <div class="profile-edit-panel glass-card" id="profile-editor-card" style="display: none;">
+                            <form id="profile-form">
+                                <input type="hidden" id="edit-profile-id">
+                                
+                                    <div class="editor-header">
+                                        <h3 id="editor-title">Edit Profile</h3>
+                                        <div class="editor-actions">
+                                            <button type="button" class="btn btn-success btn-sm" id="btn-activate-profile">Use Profile</button>
+                                            <button type="button" class="btn btn-outline btn-sm" id="btn-clone-profile">Clone</button>
+                                            <button type="button" class="btn btn-danger btn-sm" id="btn-delete-profile">Delete</button>
+                                        </div>
+                                    </div>
+
+                                <div class="form-grid">
+                                    <div class="form-group span-2">
+                                        <label for="p-name">Profile Name</label>
+                                        <input type="text" id="p-name" required autocomplete="off" placeholder="e.g. My Home Network">
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="p-mode">Operational Mode</label>
+                                        <select id="p-mode">
+                                            <option value="endpoint">Endpoint (VPN Client)</option>
+                                            <option value="relay">Relay Node (Bootstrap Server)</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="p-cluster">Cluster / Namespace ID</label>
+                                        <input type="text" id="p-cluster" required autocomplete="off" placeholder="e.g. my-vpn-cluster">
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="p-port">Listen Port (Optional)</label>
+                                        <input type="number" id="p-port" autocomplete="off" placeholder="0 (random port)">
+                                    </div>
+
+                                    <div class="form-group flex-row">
+                                        <label class="checkbox-container">
+                                            <input type="checkbox" id="p-dryrun">
+                                            <span class="checkmark"></span>
+                                            Dry-Run Mode (Mock TUN Interface)
+                                        </label>
+                                    </div>
+
+                                    <div class="form-divider span-2" id="p-divider-vpn">VPN Interface Network (Endpoints only)</div>
+
+                                    <div class="form-group" id="p-group-tunip">
+                                        <label for="p-tunip">Virtual TUN IP / CIDR</label>
+                                        <input type="text" id="p-tunip" autocomplete="off" placeholder="e.g. 10.200.0.1/24">
+                                    </div>
+
+                                    <div class="form-group" id="p-group-advertise">
+                                        <label for="p-advertise">Advertised Subnets (Comma-separated)</label>
+                                        <input type="text" id="p-advertise" autocomplete="off" placeholder="e.g. 10.100.1.0/24">
+                                    </div>
+
+                                    <div class="form-divider span-2">Security, Encryption & Identities</div>
+
+                                    <div class="form-group span-2" id="p-group-datakey">
+                                        <label>AES-256-GCM Pre-Shared Data Key</label>
+                                        <div class="input-with-button">
+                                            <input type="text" id="p-datakey" autocomplete="off" placeholder="32-byte hex-encoded key (64 hex characters)">
+                                            <button type="button" class="btn btn-outline" id="btn-gen-datakey">Generate Key</button>
+                                        </div>
+                                        <small class="help-text">Endpoints must share the exact same key to decrypt packets. Leave empty for Relays.</small>
+                                    </div>
+
+                                    <div class="form-group span-2">
+                                        <label>Identity Key Path</label>
+                                        <div class="input-with-button">
+                                            <input type="text" id="p-identity" autocomplete="off" placeholder="identity-endpoint.key">
+                                            <button type="button" class="btn btn-outline" id="btn-refresh-peerid">Fetch Peer ID</button>
+                                        </div>
+                                        <div class="peer-id-display" style="display: none;">
+                                            <span>Current Identity Peer ID:</span>
+                                            <code id="config-peer-id">None</code>
+                                            <button type="button" class="btn-copy" id="btn-copy-config-peerid" title="Copy to clipboard">Copy</button>
+                                        </div>
+                                        <button type="button" class="btn btn-outline btn-xs" id="btn-gen-identity" style="margin-top: 6px;">Generate New Identity File</button>
+                                    </div>
+
+                                    <div class="form-group span-2">
+                                        <label for="p-ca-key">CA Public Key Path (Optional PKI)</label>
+                                        <input type="text" id="p-ca-key" autocomplete="off" placeholder="e.g. /path/to/ca.pub">
+                                    </div>
+
+                                    <div class="form-group span-2">
+                                        <label>Install Node Identity Signature (Required if CA enabled)</label>
+                                        <textarea id="p-sig-content" autocomplete="off" rows="4" class="code-area" placeholder="Paste PEM block of node signature here..."></textarea>
+                                        <small class="help-text">Paste the PEM signature for this Peer ID. It will be saved locally as a .sig file and linked automatically.</small>
+                                    </div>
+
+                                    <div class="form-group span-2">
+                                        <label for="p-allowed-peers">Allowed Peers Whitelist Path (Optional Connection Gater)</label>
+                                        <input type="text" id="p-allowed-peers" autocomplete="off" placeholder="e.g. whitelist.txt">
+                                    </div>
+
+                                    <div class="form-divider span-2">Bootstrap Relays</div>
+
+                                    <div class="form-group span-2">
+                                        <label>Relay Addresses (Bootstrap Multiaddrs, one per line)</label>
+                                        <textarea id="p-relays" autocomplete="off" rows="3" placeholder="e.g. /ip4/1.2.3.4/tcp/4001/p2p/QmRelayNodePeerID"></textarea>
+                                    </div>
+                                </div>
+
+                                <div class="form-actions">
+                                    <button type="submit" class="btn btn-success">Save Configuration</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VIEW: PKI -->
+                <section id="view-pki" class="tab-view">
+                    <div class="pki-panel">
+                        <!-- CA Gen -->
+                        <div class="glass-card pki-card">
+                            <h3>1. Generate Certificate Authority (CA)</h3>
+                            <p>Generate a post-quantum FIPS 204-compliant ML-DSA-87 key pair for code signature verification and zero-trust mesh membership.</p>
+                            <div class="form-group">
+                                <label for="ca-dir">Output Directory (Optional)</label>
+                                <input type="text" id="ca-dir" placeholder="Current directory (outputs ca.pub and ca.key)">
+                            </div>
+                            <button class="btn btn-primary" id="btn-generate-ca">Generate CA Keys</button>
+                            <div id="ca-result" class="pki-status-box" style="display: none;"></div>
+                        </div>
+
+                        <!-- CA Sign -->
+                        <div class="glass-card pki-card">
+                            <h3>2. Sign Endpoint Peer ID</h3>
+                            <p>Sign an endpoint's unique Peer ID using the CA private key to authorize it for the VPN mesh.</p>
+                            <form id="pki-sign-form">
+                                <div class="form-group">
+                                    <label for="sign-ca-priv">CA Private Key Path (.key)</label>
+                                    <input type="text" id="sign-ca-priv" required placeholder="e.g. ca.key">
+                                </div>
+                                <div class="form-group">
+                                    <label for="sign-peer-id">Target Peer ID to Sign</label>
+                                    <input type="text" id="sign-peer-id" required placeholder="e.g. 12D3KooWN7G...">
+                                </div>
+                                <button type="submit" class="btn btn-primary">Sign Peer ID</button>
+                            </form>
+                            <div id="sign-result" class="pki-status-box" style="display: none;">
+                                <div class="result-header">
+                                    <span>Signature Generated successfully!</span>
+                                    <button class="btn btn-outline btn-xs" id="btn-copy-sig">Copy Signature PEM</button>
+                                </div>
+                                <pre><code id="sig-pem-content"></code></pre>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- VIEW: Logs -->
+                <section id="view-logs" class="tab-view">
+                    <div class="logs-panel glass-card">
+                        <div class="panel-header">
+                            <h3>Real-time Daemon Logs</h3>
+                            <div class="logs-actions">
+                                <button class="btn btn-outline btn-sm" id="btn-clear-logs">Clear Screen</button>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="autoscroll-logs" checked>
+                                    <span class="checkmark"></span>
+                                    Auto-scroll
+                                </label>
+                            </div>
+                        </div>
+                        <div class="log-output-container">
+                            <pre id="log-output" class="terminal-logs"></pre>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>

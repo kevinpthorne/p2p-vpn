@@ -39,6 +39,16 @@ var (
 	NodeSignature []byte
 )
 
+// Global active connections and state for API status telemetry
+var (
+	ActiveHost         host.Host
+	ActiveDHT          *dht.IpfsDHT
+	ActiveRoutingTable *RoutingTable
+	ActiveTun          TunInterface
+	TotalRxBytes       uint64
+	TotalTxBytes       uint64
+)
+
 
 // WhitelistConnectionGater filters incoming and outgoing connections based on a peer ID whitelist
 type WhitelistConnectionGater struct {
@@ -475,6 +485,7 @@ func writeFrame(w io.Writer, payload []byte, key []byte) error {
 	if _, err := w.Write(ciphertext); err != nil {
 		return err
 	}
+	atomic.AddUint64(&TotalTxBytes, uint64(len(payload)))
 	return nil
 }
 
@@ -499,13 +510,20 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	var payload []byte
+	var err error
 	if dataAEAD != nil {
 		nonce := buf[:nonceSize]
 		ciphertext := buf[nonceSize:]
-		return dataAEAD.Open(nil, nonce, ciphertext, nil)
+		payload, err = dataAEAD.Open(nil, nonce, ciphertext, nil)
+	} else {
+		payload, err = buf, nil
 	}
 
-	return buf, nil
+	if err == nil {
+		atomic.AddUint64(&TotalRxBytes, uint64(len(payload)))
+	}
+	return payload, err
 }
 
 func makeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
