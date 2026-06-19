@@ -1,4 +1,4 @@
-// MeshFlow P2P VPN Frontend Application Logic
+// p2p-vpn P2P VPN Frontend Application Logic
 
 // Client State
 let currentTab = 'dashboard';
