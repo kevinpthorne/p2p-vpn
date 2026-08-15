@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  p2p-vpn:
+    image: ghcr.io/kevinpthorne/p2p-vpn:latest
+    container_name: p2p-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: "host"  # Ensures the TUN interface and routes are created in the host's network namespace
+    volumes:
+      - /etc/p2p-vpn:/etc/p2p-vpn  # Mounts the host directory containing keys into the container
+    environment:
+      - P2P_VPN_MODE=endpoint
+      - P2P_VPN_CLUSTER=my-vpn-cluster
+      # Replace with your actual TUN IP and subnet
+      - P2P_VPN_TUN_IP=10.200.0.1/24
+      # Replace with your actual relay multiaddr
+      - P2P_VPN_RELAY=/ip4/1.2.3.4/tcp/4001/p2p/Qm...
+      # Keys loaded from the persistent host volume
+      - P2P_VPN_DATAKEY=/etc/p2p-vpn/data.key
+      - P2P_VPN_IDENTITY=/etc/p2p-vpn/identity.key
+      - P2P_VPN_CA_KEY=/etc/p2p-vpn/ca.pub
+      - P2P_VPN_NODE_SIG=/etc/p2p-vpn/node.sig
+      # Uncomment if using a whitelist:
+      # - P2P_VPN_ALLOWED_PEERS=/etc/p2p-vpn/whitelist.txt

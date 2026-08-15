@@ -215,6 +215,9 @@ helm install my-vpn oci://ghcr.io/kevinpthorne/charts/p2p-vpn --version 0.1.0 \
 - `securityContext`: Automatically configured with `privileged: true` (or `NET_ADMIN` capabilities) to allow network interface setup.
 - `tunVolume`: Mounts the host node's `/dev/net/tun` interface inside the container.
 
+### 6. Deploy on NixOS (Declarative Flake)
+This project exports a native NixOS module that runs the Go binary as a secure systemd service. For full details on how to integrate the flake and configure `services.p2p-vpn` declaratively in your `configuration.nix`, please see the [NixOS Deployment Guide](docs/nixos.md).
+
 ---
 
 ## Environment Variables

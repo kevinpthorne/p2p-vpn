@@ -142,5 +142,11 @@
           ];
         };
       }
-    );
+    ) // {
+      nixosModules.default = { pkgs, config, lib, ... }: {
+        imports = [ ./nixos/module.nix ];
+        services.p2p-vpn.package = lib.mkDefault self.packages.${pkgs.system}.default;
+      };
+      nixosModules.p2p-vpn = self.nixosModules.default;
+    };
 }
