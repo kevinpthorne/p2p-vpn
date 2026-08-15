@@ -60,11 +60,19 @@ func main() {
 	printPeerIDFlag := flag.Bool("print-peer-id", false, "Print the Peer ID of the identity key and exit")
 	guiFlag := flag.Bool("gui", false, "Start built-in web dashboard client interface")
 	guiPortFlag := flag.Int("gui-port", 4040, "Listening port for the built-in web dashboard")
+	guiHostFlag := flag.String("gui-host", getEnv("P2P_VPN_GUI_HOST", "0.0.0.0"), "Listening host for the built-in web dashboard")
+	disableGuiFlag := flag.Bool("disable-gui", getEnvBool("P2P_VPN_DISABLE_GUI", false), "Disable the built-in web dashboard client interface")
+	guiCertFlag := flag.String("gui-cert", getEnv("P2P_VPN_GUI_CERT", ""), "Path to the SSL/TLS certificate file for the GUI server")
+	guiKeyFlag := flag.String("gui-key", getEnv("P2P_VPN_GUI_KEY", ""), "Path to the SSL/TLS private key file for the GUI server")
 	flag.Parse()
 
 	if *guiFlag {
-		StartAPIServer(*guiPortFlag)
+		StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, true)
 		return
+	}
+
+	if !*disableGuiFlag {
+		go StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, false)
 	}
 
 	if *printPeerIDFlag {
@@ -400,6 +408,39 @@ func main() {
 	}
 	defer h.Close()
 
+	// Populate global active state for the API server telemetry
+	ActiveHost = h
+	ActiveDHT = dhtObj
+	ActiveRoutingTable = routingTable
+	ActiveTun = tunIfce
+	apiActiveIP = *tunIPFlag
+	apiActiveCluster = *clusterIDFlag
+	apiActiveMode = *modeFlag
+	apiActivePeerID = h.ID().String()
+	apiVPNUptimeStart = time.Now()
+	apiVPNContext = ctx
+	apiVPNCancel = cancel
+
+	var relayAddrsList []string
+	if *relayAddrsFlag != "" {
+		relayAddrsList = strings.Split(*relayAddrsFlag, ",")
+	}
+	apiActiveProfile = &Profile{
+		ID:               "cli",
+		Name:             "CLI Session",
+		Mode:             *modeFlag,
+		ClusterID:        *clusterIDFlag,
+		Port:             finalPort,
+		DryRun:           *dryRunFlag,
+		TunIP:            *tunIPFlag,
+		Advertise:        *advertiseFlag,
+		IdentityPath:     identityPath,
+		CaKeyPath:        *caKeyPathFlag,
+		NodeSigContent:   *nodeSigPathFlag,
+		AllowedPeersPath: *allowedPeersFlag,
+		RelayAddrs:       relayAddrsList,
+	}
+
 	log.Printf("---------------------------------------------")
 	log.Printf("P2P VPN Node Started. Mode: %s", strings.ToUpper(*modeFlag))
 	log.Printf("Peer ID: %s", h.ID())
@@ -667,9 +708,15 @@ func main() {
 	// 11. Graceful Shutdown Handler
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	select {
+	case <-sigChan:
+		log.Println("Received termination signal, shutting down...")
+	case <-ctx.Done():
+		log.Println("Context cancelled, shutting down...")
+	}
 
 	log.Println("🧹 Shutting down... Cleaning up routes and interfaces")
+	cleanupActiveVPN()
 	if *modeFlag == "endpoint" && tunIfce != nil {
 		// Cleanup routing table routes
 		_, _ = routingTable.UnregisterPeer("") // clean any local references if possible

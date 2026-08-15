@@ -176,7 +176,7 @@ func saveProfiles(list ProfileList) error {
 }
 
 // --- Start the API Server ---
-func StartAPIServer(port int) {
+func StartAPIServer(host string, port int, certFile, keyFile string, shouldOpenBrowser bool) {
 	// Intercept logger outputs to broadcast via SSE
 	log.SetOutput(io.MultiWriter(os.Stderr, broker))
 
@@ -242,13 +242,32 @@ func StartAPIServer(port int) {
 	http.HandleFunc("/api/pki/generate-ca", handlePKIGenerateCA)
 	http.HandleFunc("/api/pki/sign", handlePKISign)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	log.Printf("🌐 Built-in Web Server starting at http://%s/", addr)
+	scheme := "http"
+	useTLS := certFile != "" && keyFile != ""
+	if useTLS {
+		scheme = "https"
+	}
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	log.Printf("🌐 Built-in Web Server starting at %s://%s/", scheme, addr)
 	
 	// Open default browser automatically
-	go openBrowser(fmt.Sprintf("http://%s/", addr))
+	if shouldOpenBrowser {
+		browserHost := host
+		if host == "0.0.0.0" {
+			browserHost = "127.0.0.1"
+		}
+		go openBrowser(fmt.Sprintf("%s://%s:%d/", scheme, browserHost, port))
+	}
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	var err error
+	if useTLS {
+		err = http.ListenAndServeTLS(addr, certFile, keyFile, nil)
+	} else {
+		err = http.ListenAndServe(addr, nil)
+	}
+
+	if err != nil {
 		log.Fatalf("❌ API server error: %v", err)
 	}
 }
