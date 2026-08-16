@@ -279,9 +279,10 @@ func main() {
 		}
 		sigBytes, err := pki.DecodeSignaturePEM(sigPEM)
 		if err != nil || len(sigBytes) == 0 {
-			log.Fatalf("❌ FATAL: Failed to decode node signature: %v", err)
+			log.Fatalf("❌ FATAL: Failed to validate node signature: %v", err)
 		}
-		pki.NodeSignature = sigBytes
+		// Store the full PEM so SelectSignatureForHandshake can pick the correct block later
+		pki.NodeSignature = sigPEM
 		log.Println("🛡️ Node Signature loaded for CA verification")
 	}
 

@@ -101,8 +101,19 @@ func ReadPublicKeyBytes(path string) (*mldsa87.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// Try to decode as PEM first
+	block, _ := pem.Decode(keyBytes)
+	var rawKey []byte
+	if block != nil {
+		rawKey = block.Bytes
+	} else {
+		// Fallback to assuming it's raw binary
+		rawKey = keyBytes
+	}
+
 	pubKey := new(mldsa87.PublicKey)
-	if err := pubKey.UnmarshalBinary(keyBytes); err != nil {
+	if err := pubKey.UnmarshalBinary(rawKey); err != nil {
 		return nil, err
 	}
 	return pubKey, nil
