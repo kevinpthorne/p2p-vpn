@@ -64,7 +64,7 @@ func setupTestNode(
 
 	// Set symmetric Handshake Handler
 	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-		HandleIncomingHandshake(nodeCtx, h, s, virtualIP, advertiseSubnets, rt, tunIfce, caPub, nodeSig)
+		HandleIncomingHandshake(nodeCtx, h, s, virtualIP, advertiseSubnets, rt, tunIfce, caPub, nodeSig, false)
 	})
 
 	if mode == "endpoint" {
@@ -102,7 +102,7 @@ func setupTestNode(
 				localVIP = virtualIP
 				localSubs = advertiseSubnets
 			}
-			go pushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig)
+			go pushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig, false)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
@@ -163,9 +163,10 @@ func TestMeshCASecurity(t *testing.T) {
 		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
 		sigs[id] = sig
 	}
-	for _, id := range epIDs {
+	for i, id := range epIDs {
 		sig := make([]byte, mldsa87.SignatureSize)
-		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
+		virtualIP := fmt.Sprintf("10.200.0.%d/24", i+1)
+		_ = mldsa87.SignTo(caPriv, []byte(fmt.Sprintf("%s|%s", id.String(), virtualIP)), []byte("p2p-vpn-auth"), true, sig)
 		sigs[id] = sig
 	}
 
@@ -343,7 +344,7 @@ func TestMeshCASecurity(t *testing.T) {
 	ep7Priv, _, _ := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	ep7ID, _ := peer.IDFromPrivateKey(ep7Priv)
 	fakeSig := make([]byte, mldsa87.SignatureSize)
-	_ = mldsa87.SignTo(fakeCaPriv, []byte(ep7ID.String()), []byte("p2p-vpn-auth"), true, fakeSig)
+	_ = mldsa87.SignTo(fakeCaPriv, []byte(fmt.Sprintf("%s|10.200.0.7/24", ep7ID.String())), []byte("p2p-vpn-auth"), true, fakeSig)
 
 	ep7 := setupTestNode(ctx, t, "endpoint", ep7Priv, relayAddrs, 0, clusterID, nil, caPub, fakeSig, "10.200.0.7/24", []string{"10.100.7.0/24"})
 	defer ep7.h.Close()

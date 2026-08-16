@@ -46,6 +46,7 @@ type Profile struct {
 	NodeSigContent   string   `json:"node_sig_content"`
 	AllowedPeersPath string   `json:"allowed_peers_path"`
 	RelayAddrs       []string `json:"relay_addrs"`
+	DisableIPAuth    bool     `json:"disable_ip_auth"`
 }
 
 type ProfileList struct {
@@ -829,6 +830,7 @@ func handlePKISign(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CAPrivPath string `json:"ca_priv_path"`
 		PeerID     string `json:"peer_id"`
+		VirtualIP  string `json:"virtual_ip"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -865,7 +867,12 @@ func handlePKISign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg := []byte(targetPeerID.String())
+	var msg []byte
+	if req.VirtualIP != "" {
+		msg = []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), req.VirtualIP))
+	} else {
+		msg = []byte(targetPeerID.String())
+	}
 	ctxBytes := []byte("p2p-vpn-auth")
 	sigBytes := make([]byte, mldsa87.SignatureSize)
 	err = mldsa87.SignTo(sk, msg, ctxBytes, true, sigBytes)
@@ -1138,7 +1145,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 			localVIP = p.TunIP
 			localSubs = advertisedSubnets
 		}
-		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, p.DisableIPAuth)
 	})
 
 	if p.Mode == "endpoint" {
@@ -1180,7 +1187,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 				localVIP = p.TunIP
 				localSubs = advertisedSubnets
 			}
-			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, p.DisableIPAuth)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()

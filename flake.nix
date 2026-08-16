@@ -6,18 +6,27 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs { inherit system; };
 
         # Define native package (for devShell and default binary of the host platform)
         p2p-vpn-native = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
-          ldflags = [ "-s" "-w" ];
+          ldflags = [
+            "-s"
+            "-w"
+          ];
         };
 
         # --- AMD64 TARGET ---
@@ -28,7 +37,11 @@
           CGO_ENABLED = "0";
           doCheck = false;
 
-          env = builtins.removeAttrs (oldAttrs.env or {}) [ "GOOS" "GOARCH" "CGO_ENABLED" ];
+          env = builtins.removeAttrs (oldAttrs.env or { }) [
+            "GOOS"
+            "GOARCH"
+            "CGO_ENABLED"
+          ];
 
           # Move the cross-compiled binary to the main bin/ directory if it was cross-compiled
           postInstall = ''
@@ -69,7 +82,11 @@
           CGO_ENABLED = "0";
           doCheck = false;
 
-          env = builtins.removeAttrs (oldAttrs.env or {}) [ "GOOS" "GOARCH" "CGO_ENABLED" ];
+          env = builtins.removeAttrs (oldAttrs.env or { }) [
+            "GOOS"
+            "GOARCH"
+            "CGO_ENABLED"
+          ];
 
           # Move the cross-compiled binary to the main bin/ directory if it was cross-compiled
           postInstall = ''
@@ -107,10 +124,13 @@
         # Build for Windows amd64 using Go's native cross-compilation capabilities
         p2p-vpn-windows = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn-windows";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
-          ldflags = [ "-s" "-w" ];
+          ldflags = [
+            "-s"
+            "-w"
+          ];
           doCheck = false;
 
           env = {
@@ -142,11 +162,19 @@
           ];
         };
       }
-    ) // {
-      nixosModules.default = { pkgs, config, lib, ... }: {
-        imports = [ ./nixos/module.nix ];
-        services.p2p-vpn.package = lib.mkDefault self.packages.${pkgs.system}.default;
-      };
+    )
+    // {
+      nixosModules.default =
+        {
+          pkgs,
+          config,
+          lib,
+          ...
+        }:
+        {
+          imports = [ ./nixos/module.nix ];
+          services.p2p-vpn.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
       nixosModules.p2p-vpn = self.nixosModules.default;
     };
 }

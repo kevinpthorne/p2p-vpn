@@ -56,6 +56,8 @@ func main() {
 	nodeSigPathFlag := flag.String("node-sig", getEnv("P2P_VPN_NODE_SIG", ""), "Path to this node's PEM-encoded signature file")
 	caKeyPrivPathFlag := flag.String("ca-key-priv", "", "Path to the CA's PEM-encoded private key file (for ca-sign mode)")
 	peerIDFlag := flag.String("peer", "", "Target Peer ID to sign (for ca-sign mode)")
+	signIPFlag := flag.String("sign-ip", "", "Virtual IP/CIDR to bind to the signature (optional)")
+	disableIPAuthFlag := flag.Bool("disable-ip-auth", getEnvBool("P2P_VPN_DISABLE_IP_AUTH", false), "Disable IP authentication in CA signatures (allows routes for any valid PeerID signature - for backwards compatibility)")
 	sigPathFlag := flag.String("sig", "", "Path to the signature file to verify (for ca-verify mode)")
 	printPeerIDFlag := flag.Bool("print-peer-id", false, "Print the Peer ID of the identity key and exit")
 	guiFlag := flag.Bool("gui", false, "Start built-in web dashboard client interface")
@@ -155,7 +157,12 @@ func main() {
 			log.Fatalf("❌ FATAL: Invalid CA private key format: %v", err)
 		}
 
-		msg := []byte(targetPeerID.String())
+		var msg []byte
+		if *signIPFlag != "" {
+			msg = []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), *signIPFlag))
+		} else {
+			msg = []byte(targetPeerID.String())
+		}
 		ctxBytes := []byte("p2p-vpn-auth")
 		sigBytes := make([]byte, mldsa87.SignatureSize)
 		err = mldsa87.SignTo(sk, msg, ctxBytes, true, sigBytes)
@@ -210,7 +217,14 @@ func main() {
 			log.Fatalf("❌ FATAL: Invalid Peer ID: %v", err)
 		}
 
-		valid := mldsa87.Verify(pk, []byte(targetPeerID.String()), []byte("p2p-vpn-auth"), sigBytes)
+		var msg []byte
+		if *signIPFlag != "" {
+			msg = []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), *signIPFlag))
+		} else {
+			msg = []byte(targetPeerID.String())
+		}
+
+		valid := mldsa87.Verify(pk, msg, []byte("p2p-vpn-auth"), sigBytes)
 		if valid {
 			log.Println("✅ Success: Signature is VALID for this Peer ID!")
 		} else {
@@ -477,7 +491,7 @@ func main() {
 			localVIP = *tunIPFlag
 			localSubs = advertisedSubnets
 		}
-		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, *disableIPAuthFlag)
 	})
 
 	if *modeFlag == "endpoint" {
@@ -526,7 +540,7 @@ func main() {
 				localVIP = *tunIPFlag
 				localSubs = advertisedSubnets
 			}
-			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature)
+			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, *disableIPAuthFlag)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()

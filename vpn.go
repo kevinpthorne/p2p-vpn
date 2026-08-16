@@ -129,7 +129,7 @@ func decodeSignaturePEM(pemBytes []byte) ([]byte, error) {
 	return block.Bytes, nil
 }
 
-func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte) {
+func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
 	defer s.Close()
 	remotePeer := s.Conn().RemotePeer()
 	log.Printf("🤝 Incoming handshake stream from %s", remotePeer)
@@ -138,6 +138,11 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 	if err := json.NewDecoder(s).Decode(&msg); err != nil {
 		log.Printf("⚠️ Failed to parse handshake message from %s: %v", remotePeer, err)
 		return
+	}
+
+	isIPAuthenticated := false
+	if disableIPAuth {
+		isIPAuthenticated = true
 	}
 
 	// Verify CA signature if PKI is enabled
@@ -149,19 +154,36 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 			h.Network().ClosePeer(remotePeer)
 			return
 		}
-		if !mldsa87.Verify(caPubKey, []byte(remotePeer.String()), []byte("p2p-vpn-auth"), sigBytes) {
+
+		sigValid := false
+		if msg.VirtualIP != "" {
+			if mldsa87.Verify(caPubKey, []byte(fmt.Sprintf("%s|%s", remotePeer.String(), msg.VirtualIP)), []byte("p2p-vpn-auth"), sigBytes) {
+				sigValid = true
+				isIPAuthenticated = true
+			}
+		}
+
+		if !sigValid {
+			if mldsa87.Verify(caPubKey, []byte(remotePeer.String()), []byte("p2p-vpn-auth"), sigBytes) {
+				sigValid = true
+			}
+		}
+
+		if !sigValid {
 			log.Printf("❌ Incoming handshake rejected: signature verification FAILED for %s", remotePeer)
 			s.Reset()
 			h.Network().ClosePeer(remotePeer)
 			return
 		}
 		log.Printf("🛡️ CA signature verified for incoming peer %s", remotePeer)
+	} else {
+		isIPAuthenticated = true
 	}
 
 	log.Printf("📝 Handshake: Peer %s reports Virtual IP: %s, Subnets: %v", remotePeer, msg.VirtualIP, msg.Subnets)
 
 	// Register peer and configure routes if virtual IP is set
-	if msg.VirtualIP != "" {
+	if msg.VirtualIP != "" && isIPAuthenticated {
 		newSubnets, oldSubnets := routingTable.RegisterPeer(remotePeer, msg.VirtualIP, msg.Subnets)
 		if tunIfce != nil {
 			newSet := make(map[string]bool)
@@ -629,7 +651,7 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 }
 
 // Handshake execution
-func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte) {
+func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
 	log.Printf("🤝 Sending routing handshake to peer %s", pid)
 	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -667,6 +689,11 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 		return
 	}
 
+	isIPAuthenticated := false
+	if disableIPAuth {
+		isIPAuthenticated = true
+	}
+
 	// Verify CA signature if PKI is enabled
 	if caPubKey != nil {
 		sigBytes, err := decodeSignaturePEM([]byte(respMsg.Signature))
@@ -676,19 +703,36 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 			h.Network().ClosePeer(pid)
 			return
 		}
-		if !mldsa87.Verify(caPubKey, []byte(pid.String()), []byte("p2p-vpn-auth"), sigBytes) {
+
+		sigValid := false
+		if respMsg.VirtualIP != "" {
+			if mldsa87.Verify(caPubKey, []byte(fmt.Sprintf("%s|%s", pid.String(), respMsg.VirtualIP)), []byte("p2p-vpn-auth"), sigBytes) {
+				sigValid = true
+				isIPAuthenticated = true
+			}
+		}
+
+		if !sigValid {
+			if mldsa87.Verify(caPubKey, []byte(pid.String()), []byte("p2p-vpn-auth"), sigBytes) {
+				sigValid = true
+			}
+		}
+
+		if !sigValid {
 			log.Printf("❌ Outbound handshake rejected: signature verification FAILED for %s", pid)
 			s.Reset()
 			h.Network().ClosePeer(pid)
 			return
 		}
 		log.Printf("🛡️ CA signature verified for outbound peer %s", pid)
+	} else {
+		isIPAuthenticated = true
 	}
 
 	log.Printf("📝 Handshake response: Peer %s reports Virtual IP: %s, Subnets: %v", pid, respMsg.VirtualIP, respMsg.Subnets)
 
 	// 3. Register peer and add routes
-	if respMsg.VirtualIP != "" {
+	if respMsg.VirtualIP != "" && isIPAuthenticated {
 		newSubnets, oldSubnets := routingTable.RegisterPeer(pid, respMsg.VirtualIP, respMsg.Subnets)
 		if tunIfce != nil {
 			newSet := make(map[string]bool)
