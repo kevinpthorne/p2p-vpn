@@ -5,4 +5,4 @@ p2p-vpn.*
 *.pub
 whitelist.txt
 result*
-result-*
+result-*vendor/

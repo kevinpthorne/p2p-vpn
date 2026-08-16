@@ -1,4 +1,4 @@
-package main
+package vpn
 
 import (
 	"context"
@@ -6,20 +6,18 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	"github.com/kevinpthorne/p2p-vpn/pkg/pki"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/connmgr"
@@ -49,11 +47,10 @@ var (
 	TotalTxBytes       uint64
 )
 
-
 // WhitelistConnectionGater filters incoming and outgoing connections based on a peer ID whitelist
 type WhitelistConnectionGater struct {
-	allowedPeers map[peer.ID]bool
-	mu           sync.RWMutex
+	Mu           sync.RWMutex
+	AllowedPeers map[peer.ID]bool
 }
 
 var _ connmgr.ConnectionGater = (*WhitelistConnectionGater)(nil)
@@ -64,20 +61,20 @@ func NewWhitelistConnectionGater(allowed []peer.ID) *WhitelistConnectionGater {
 		m[p] = true
 	}
 	return &WhitelistConnectionGater{
-		allowedPeers: m,
+		AllowedPeers: m,
 	}
 }
 
 func (g *WhitelistConnectionGater) InterceptPeerDial(p peer.ID) bool {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.allowedPeers[p]
+	g.Mu.RLock()
+	defer g.Mu.RUnlock()
+	return g.AllowedPeers[p]
 }
 
 func (g *WhitelistConnectionGater) InterceptAddrDial(p peer.ID, addr multiaddr.Multiaddr) bool {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.allowedPeers[p]
+	g.Mu.RLock()
+	defer g.Mu.RUnlock()
+	return g.AllowedPeers[p]
 }
 
 func (g *WhitelistConnectionGater) InterceptAccept(c network.ConnMultiaddrs) bool {
@@ -85,15 +82,14 @@ func (g *WhitelistConnectionGater) InterceptAccept(c network.ConnMultiaddrs) boo
 }
 
 func (g *WhitelistConnectionGater) InterceptSecured(dir network.Direction, p peer.ID, c network.ConnMultiaddrs) bool {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.allowedPeers[p]
+	g.Mu.RLock()
+	defer g.Mu.RUnlock()
+	return g.AllowedPeers[p]
 }
 
 func (g *WhitelistConnectionGater) InterceptUpgraded(c network.Conn) (bool, control.DisconnectReason) {
 	return true, 0
 }
-
 
 // Configuration Constants
 const (
@@ -106,27 +102,6 @@ type HandshakeMessage struct {
 	VirtualIP string   `json:"virtual_ip"` // e.g. "10.200.0.1/24"
 	Subnets   []string `json:"subnets"`    // e.g. ["10.100.1.0/24"]
 	Signature string   `json:"signature"`  // PEM or hex encoded ML-DSA-87 signature
-}
-
-func encodeSignaturePEM(sigBytes []byte) string {
-	block := &pem.Block{
-		Type:  "ML-DSA-87 SIGNATURE",
-		Bytes: sigBytes,
-	}
-	return string(pem.EncodeToMemory(block))
-}
-
-func decodeSignaturePEM(pemBytes []byte) ([]byte, error) {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil || block.Type != "ML-DSA-87 SIGNATURE" {
-		// Fallback to raw hex if not a valid PEM block
-		str := strings.TrimSpace(string(pemBytes))
-		if hexBytes, err := hex.DecodeString(str); err == nil {
-			return hexBytes, nil
-		}
-		return pemBytes, nil
-	}
-	return block.Bytes, nil
 }
 
 func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
@@ -147,7 +122,7 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 
 	// Verify CA signature if PKI is enabled
 	if caPubKey != nil {
-		sigBytes, err := decodeSignaturePEM([]byte(msg.Signature))
+		sigBytes, err := pki.DecodeSignaturePEM([]byte(msg.Signature))
 		if err != nil || len(sigBytes) == 0 {
 			log.Printf("❌ Incoming handshake rejected: missing or invalid signature format from %s", remotePeer)
 			s.Reset()
@@ -208,14 +183,26 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 		routingTable.RegisterPeer(remotePeer, "", nil)
 	}
 
+	hideIP := false
+	if msg.VirtualIP == "" {
+		hideIP = true // The other side is hiding their IP (relay), we must do the same
+	}
+
 	// Respond back with our own routing information
+	respVIP := localVirtualIP
+	respSubs := localSubnets
+	if hideIP {
+		respVIP = ""
+		respSubs = nil
+	}
+
 	respSig := ""
 	if len(localSignature) > 0 {
-		respSig = encodeSignaturePEM(localSignature)
+		respSig = pki.SelectSignatureForHandshake(localSignature, hideIP)
 	}
 	resp := HandshakeMessage{
-		VirtualIP: localVirtualIP,
-		Subnets:   localSubnets,
+		VirtualIP: respVIP,
+		Subnets:   respSubs,
 		Signature: respSig,
 	}
 	if err := json.NewEncoder(s).Encode(&resp); err != nil {
@@ -225,7 +212,6 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 	log.Printf("✅ Bidirectional handshake response successfully sent to %s", remotePeer)
 }
 
-
 // PeerRoutes holds routing information for a remote peer
 type PeerRoutes struct {
 	VirtualIP string
@@ -234,9 +220,9 @@ type PeerRoutes struct {
 
 // RoutingTable manages mappings from IP/Subnets to Peer IDs and streams
 type RoutingTable struct {
-	mu            sync.RWMutex
+	Mu            sync.RWMutex
+	PeerInfo      map[peer.ID]*PeerRoutes
 	ipToPeer      map[string]peer.ID
-	peerInfo      map[peer.ID]*PeerRoutes
 	activeStreams map[peer.ID]network.Stream
 	streamMutexes map[peer.ID]*sync.Mutex
 	queues        map[peer.ID]chan []byte
@@ -246,7 +232,7 @@ type RoutingTable struct {
 func NewRoutingTable() *RoutingTable {
 	return &RoutingTable{
 		ipToPeer:      make(map[string]peer.ID),
-		peerInfo:      make(map[peer.ID]*PeerRoutes),
+		PeerInfo:      make(map[peer.ID]*PeerRoutes),
 		activeStreams: make(map[peer.ID]network.Stream),
 		streamMutexes: make(map[peer.ID]*sync.Mutex),
 		queues:        make(map[peer.ID]chan []byte),
@@ -254,8 +240,8 @@ func NewRoutingTable() *RoutingTable {
 }
 
 func (rt *RoutingTable) RegisterPeer(pid peer.ID, virtualIP string, subnets []string) (newSubnets []string, oldSubnets []string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 
 	// Strip CIDR mask for virtual IP mapping
 	ip, _, err := net.ParseCIDR(virtualIP)
@@ -263,12 +249,12 @@ func (rt *RoutingTable) RegisterPeer(pid peer.ID, virtualIP string, subnets []st
 		rt.ipToPeer[ip.String()] = pid
 	}
 
-	oldInfo := rt.peerInfo[pid]
+	oldInfo := rt.PeerInfo[pid]
 	if oldInfo != nil {
 		oldSubnets = oldInfo.Subnets
 	}
 
-	rt.peerInfo[pid] = &PeerRoutes{
+	rt.PeerInfo[pid] = &PeerRoutes{
 		VirtualIP: virtualIP,
 		Subnets:   subnets,
 	}
@@ -277,10 +263,10 @@ func (rt *RoutingTable) RegisterPeer(pid peer.ID, virtualIP string, subnets []st
 }
 
 func (rt *RoutingTable) UnregisterPeer(pid peer.ID) (virtualIP string, subnets []string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 
-	info := rt.peerInfo[pid]
+	info := rt.PeerInfo[pid]
 	if info != nil {
 		virtualIP = info.VirtualIP
 		subnets = info.Subnets
@@ -288,7 +274,7 @@ func (rt *RoutingTable) UnregisterPeer(pid peer.ID) (virtualIP string, subnets [
 		if err == nil {
 			delete(rt.ipToPeer, ip.String())
 		}
-		delete(rt.peerInfo, pid)
+		delete(rt.PeerInfo, pid)
 	}
 
 	if s, ok := rt.activeStreams[pid]; ok {
@@ -304,8 +290,8 @@ func (rt *RoutingTable) UnregisterPeer(pid peer.ID) (virtualIP string, subnets [
 }
 
 func (rt *RoutingTable) LookupPeer(destIP net.IP) (peer.ID, bool) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
+	rt.Mu.RLock()
+	defer rt.Mu.RUnlock()
 
 	destStr := destIP.String()
 	if pid, ok := rt.ipToPeer[destStr]; ok {
@@ -313,7 +299,7 @@ func (rt *RoutingTable) LookupPeer(destIP net.IP) (peer.ID, bool) {
 	}
 
 	// Subnet routing checks
-	for pid, info := range rt.peerInfo {
+	for pid, info := range rt.PeerInfo {
 		for _, subnetStr := range info.Subnets {
 			_, subnet, err := net.ParseCIDR(subnetStr)
 			if err == nil && subnet.Contains(destIP) {
@@ -326,36 +312,36 @@ func (rt *RoutingTable) LookupPeer(destIP net.IP) (peer.ID, bool) {
 }
 
 func (rt *RoutingTable) GetStream(pid peer.ID) (network.Stream, bool) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
+	rt.Mu.RLock()
+	defer rt.Mu.RUnlock()
 	s, ok := rt.activeStreams[pid]
 	return s, ok
 }
 
 func (rt *RoutingTable) SetStream(pid peer.ID, s network.Stream) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 	rt.activeStreams[pid] = s
 }
 
 func (rt *RoutingTable) ClearStream(pid peer.ID) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 	delete(rt.activeStreams, pid)
 }
 
 func (rt *RoutingTable) ClearStreamIfMatches(pid peer.ID, s network.Stream) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 	if rt.activeStreams[pid] == s {
 		delete(rt.activeStreams, pid)
 	}
 }
 
 func (rt *RoutingTable) HasPeer(pid peer.ID) bool {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	_, ok := rt.peerInfo[pid]
+	rt.Mu.RLock()
+	defer rt.Mu.RUnlock()
+	_, ok := rt.PeerInfo[pid]
 	return ok
 }
 
@@ -413,7 +399,7 @@ func (rt *RoutingTable) peerWorkerLoop(ctx context.Context, pid peer.ID, q chan 
 					defer rt.ClearStreamIfMatches(pid, stream)
 					log.Printf("📥 Reader loop started on outbound tunnel stream to %s", pid)
 					for {
-						packet, err := readFrame(stream, dataKey)
+						packet, err := ReadFrame(stream, dataKey)
 						if err != nil {
 							break
 						}
@@ -439,8 +425,8 @@ func (rt *RoutingTable) peerWorkerLoop(ctx context.Context, pid peer.ID, q chan 
 }
 
 func (rt *RoutingTable) GetStreamMutex(pid peer.ID) *sync.Mutex {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.Mu.Lock()
+	defer rt.Mu.Unlock()
 	m, ok := rt.streamMutexes[pid]
 	if !ok {
 		m = &sync.Mutex{}
@@ -451,9 +437,9 @@ func (rt *RoutingTable) GetStreamMutex(pid peer.ID) *sync.Mutex {
 
 // Cryptography Caching & Fast Nonces
 var (
-	dataAEAD   cipher.AEAD
-	nonceSalt  uint32
-	nonceSeq   uint64
+	dataAEAD  cipher.AEAD
+	nonceSalt uint32
+	nonceSeq  uint64
 )
 
 func InitCipher(key []byte) error {
@@ -511,7 +497,7 @@ func writeFrame(w io.Writer, payload []byte, key []byte) error {
 	return nil
 }
 
-func readFrame(r io.Reader, key []byte) ([]byte, error) {
+func ReadFrame(r io.Reader, key []byte) ([]byte, error) {
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
 		return nil, err
@@ -548,7 +534,7 @@ func readFrame(r io.Reader, key []byte) ([]byte, error) {
 	return payload, err
 }
 
-func makeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
+func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 	udpListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 
@@ -612,7 +598,7 @@ func makeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAdd
 	return h, kademliaDHT, err
 }
 
-func getIdentity(path string) (crypto.PrivKey, error) {
+func GetIdentity(path string) (crypto.PrivKey, error) {
 	if _, err := os.Stat(path); err == nil {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -632,7 +618,7 @@ func protocolPrefixForCluster(clusterID string) protocol.ID {
 	return protocol.ID(fmt.Sprintf("/p2p-vpn/%s/kad/1.0.0", clusterID))
 }
 
-func connectToPeer(ctx context.Context, h host.Host, target string) {
+func ConnectToPeer(ctx context.Context, h host.Host, target string) {
 	ma, err := multiaddr.NewMultiaddr(target)
 	if err != nil {
 		log.Printf("⚠️ Invalid bootstrap address %q: %v", target, err)
@@ -651,7 +637,7 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 }
 
 // Handshake execution
-func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
+func PushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool, isRelay bool) {
 	log.Printf("🤝 Sending routing handshake to peer %s", pid)
 	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -665,13 +651,22 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 	defer s.Close()
 
 	// 1. Write our handshake
+	hideIP := isRelay
+
+	reqVIP := localVirtualIP
+	reqSubs := localSubnets
+	if hideIP {
+		reqVIP = ""
+		reqSubs = nil
+	}
+
 	localSig := ""
 	if len(localSignature) > 0 {
-		localSig = encodeSignaturePEM(localSignature)
+		localSig = pki.SelectSignatureForHandshake(localSignature, hideIP)
 	}
 	msg := HandshakeMessage{
-		VirtualIP: localVirtualIP,
-		Subnets:   localSubnets,
+		VirtualIP: reqVIP,
+		Subnets:   reqSubs,
 		Signature: localSig,
 	}
 
@@ -696,7 +691,7 @@ func pushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 
 	// Verify CA signature if PKI is enabled
 	if caPubKey != nil {
-		sigBytes, err := decodeSignaturePEM([]byte(respMsg.Signature))
+		sigBytes, err := pki.DecodeSignaturePEM([]byte(respMsg.Signature))
 		if err != nil || len(sigBytes) == 0 {
 			log.Printf("❌ Outbound handshake rejected: missing or invalid signature format from %s", pid)
 			s.Reset()
@@ -779,3 +774,29 @@ func StartCAAuthKicker(ctx context.Context, h host.Host, routingTable *RoutingTa
 	}()
 }
 
+func MakeMockUDPPacket(srcIP, destIP net.IP, payload []byte) []byte {
+	totalLen := 20 + 8 + len(payload)
+	pkt := make([]byte, totalLen)
+
+	// IP Header
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0x4000)
+	pkt[8] = 64
+	pkt[9] = 17 // UDP
+	copy(pkt[12:16], srcIP.To4())
+	copy(pkt[16:20], destIP.To4())
+
+	// UDP Header
+	binary.BigEndian.PutUint16(pkt[20:22], 12345) // Src Port
+	binary.BigEndian.PutUint16(pkt[22:24], 9999)  // Dest Port
+	binary.BigEndian.PutUint16(pkt[24:26], uint16(8+len(payload)))
+	binary.BigEndian.PutUint16(pkt[26:28], 0)
+
+	// Payload
+	copy(pkt[28:], payload)
+
+	return pkt
+}

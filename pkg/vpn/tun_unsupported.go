@@ -1,6 +1,6 @@
 //go:build !linux && !darwin && !windows
 
-package main
+package vpn
 
 import (
 	"fmt"

@@ -1,8 +1,9 @@
-package main
+package vpn
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/multiformats/go-multiaddr"
 )
 
 type TestNode struct {
@@ -43,7 +45,7 @@ func setupTestNode(
 	virtualIP string,
 	advertiseSubnets []string,
 ) *TestNode {
-	h, dhtObj, err := makeHost(ctx, mode, privKey, relayAddrs, port, clusterID, allowedPeers)
+	h, dhtObj, err := MakeHost(ctx, mode, privKey, relayAddrs, port, clusterID, allowedPeers)
 	if err != nil {
 		t.Fatalf("failed to start %s host: %v", mode, err)
 	}
@@ -75,7 +77,7 @@ func setupTestNode(
 			defer s.Close()
 			defer rt.ClearStreamIfMatches(remotePeer, s)
 			for {
-				packet, err := readFrame(s, nil)
+				packet, err := ReadFrame(s, nil)
 				if err != nil {
 					break
 				}
@@ -102,7 +104,18 @@ func setupTestNode(
 				localVIP = virtualIP
 				localSubs = advertiseSubnets
 			}
-			go pushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig, false)
+			isRelay := false
+			for _, rAddr := range relayAddrs {
+				if p2pAddr, err := multiaddr.NewMultiaddr(rAddr); err == nil {
+					if info, err := peer.AddrInfoFromP2pAddr(p2pAddr); err == nil {
+						if info.ID == remotePeer {
+							isRelay = true
+							break
+						}
+					}
+				}
+			}
+			go PushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig, false, isRelay)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
@@ -161,13 +174,30 @@ func TestMeshCASecurity(t *testing.T) {
 	for _, id := range []peer.ID{r1ID, r2ID} {
 		sig := make([]byte, mldsa87.SignatureSize)
 		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
-		sigs[id] = sig
+		sigs[id] = pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 SIGNATURE",
+			Bytes: sig,
+		})
 	}
 	for i, id := range epIDs {
-		sig := make([]byte, mldsa87.SignatureSize)
+		// 1. Base Signature
+		baseSig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, baseSig)
+		sigPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 SIGNATURE",
+			Bytes: baseSig,
+		})
+
+		// 2. Routing Signature
 		virtualIP := fmt.Sprintf("10.200.0.%d/24", i+1)
-		_ = mldsa87.SignTo(caPriv, []byte(fmt.Sprintf("%s|%s", id.String(), virtualIP)), []byte("p2p-vpn-auth"), true, sig)
-		sigs[id] = sig
+		routingSig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(fmt.Sprintf("%s|%s", id.String(), virtualIP)), []byte("p2p-vpn-auth"), true, routingSig)
+		routingPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 ROUTING SIGNATURE",
+			Bytes: routingSig,
+		})
+		sigPEM = append(sigPEM, routingPEM...)
+		sigs[id] = sigPEM
 	}
 
 	// 2. Launch 2 Relays (enforcing CA signatures)
@@ -197,8 +227,8 @@ func TestMeshCASecurity(t *testing.T) {
 		defer endpoints[i].h.Close()
 		defer endpoints[i].cancel()
 
-		connectToPeer(ctx, endpoints[i].h, r1Addr)
-		connectToPeer(ctx, endpoints[i].h, r2Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r1Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
 		go func(n *TestNode) {
@@ -274,9 +304,9 @@ func TestMeshCASecurity(t *testing.T) {
 			default:
 				allConnected := true
 				for _, ep := range endpoints {
-					ep.routingTable.mu.RLock()
-					peerCount := len(ep.routingTable.peerInfo)
-					ep.routingTable.mu.RUnlock()
+					ep.routingTable.Mu.RLock()
+					peerCount := len(ep.routingTable.PeerInfo)
+					ep.routingTable.Mu.RUnlock()
 					if peerCount < 4 { // Should connect to the other 4 endpoints
 						allConnected = false
 					}
@@ -306,7 +336,7 @@ func TestMeshCASecurity(t *testing.T) {
 	srcIP := net.ParseIP("10.200.0.1")
 	dstIP := net.ParseIP("10.200.0.5")
 	payload := []byte("Hello via ML-DSA-87 PKI Mesh!")
-	pkt := makeMockUDPPacket(srcIP, dstIP, payload)
+	pkt := MakeMockUDPPacket(srcIP, dstIP, payload)
 
 	endpoints[0].tun.InjectPacket(pkt)
 
@@ -418,8 +448,8 @@ func TestMeshConnectionGater(t *testing.T) {
 		defer endpoints[i].h.Close()
 		defer endpoints[i].cancel()
 
-		connectToPeer(ctx, endpoints[i].h, r1Addr)
-		connectToPeer(ctx, endpoints[i].h, r2Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r1Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
 		go func(n *TestNode) {
@@ -467,9 +497,9 @@ func TestMeshConnectionGater(t *testing.T) {
 			default:
 				allConnected := true
 				for _, ep := range endpoints {
-					ep.routingTable.mu.RLock()
-					peerCount := len(ep.routingTable.peerInfo)
-					ep.routingTable.mu.RUnlock()
+					ep.routingTable.Mu.RLock()
+					peerCount := len(ep.routingTable.PeerInfo)
+					ep.routingTable.Mu.RUnlock()
 					if peerCount < 4 {
 						allConnected = false
 					}
@@ -548,10 +578,48 @@ func TestMeshCombinedMode(t *testing.T) {
 	allowedPeers = append(allowedPeers, epIDs...)
 
 	sigs := make(map[peer.ID][]byte)
-	for _, id := range allowedPeers {
+	for _, id := range []peer.ID{r1ID, r2ID} {
 		sig := make([]byte, mldsa87.SignatureSize)
 		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, sig)
-		sigs[id] = sig
+		sigs[id] = pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 SIGNATURE",
+			Bytes: sig,
+		})
+	}
+
+	// Create dual signatures for endpoints
+	allEpIDs := append([]peer.ID{ep7ID}, epIDs...)
+	for i, id := range allEpIDs {
+		// 1. Base Signature
+		baseSig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(id.String()), []byte("p2p-vpn-auth"), true, baseSig)
+		sigPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 SIGNATURE",
+			Bytes: baseSig,
+		})
+
+		// 2. Routing Signature
+		epIdx := i // Not exact, but we just need unique IPs for signatures
+		virtualIP := fmt.Sprintf("10.200.0.%d/24", epIdx+10)
+		if id != ep7ID {
+			for j, e := range epIDs {
+				if e == id {
+					virtualIP = fmt.Sprintf("10.200.0.%d/24", j+1)
+					break
+				}
+			}
+		} else {
+			virtualIP = "10.200.0.7/24"
+		}
+
+		routingSig := make([]byte, mldsa87.SignatureSize)
+		_ = mldsa87.SignTo(caPriv, []byte(fmt.Sprintf("%s|%s", id.String(), virtualIP)), []byte("p2p-vpn-auth"), true, routingSig)
+		routingPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 ROUTING SIGNATURE",
+			Bytes: routingSig,
+		})
+		sigPEM = append(sigPEM, routingPEM...)
+		sigs[id] = sigPEM
 	}
 
 	// 2. Launch 2 Relays (both Whitelist and CA enabled)
@@ -581,8 +649,8 @@ func TestMeshCombinedMode(t *testing.T) {
 		defer endpoints[i].h.Close()
 		defer endpoints[i].cancel()
 
-		connectToPeer(ctx, endpoints[i].h, r1Addr)
-		connectToPeer(ctx, endpoints[i].h, r2Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r1Addr)
+		ConnectToPeer(ctx, endpoints[i].h, r2Addr)
 
 		// Start Discovery loops
 		go func(n *TestNode) {
@@ -630,9 +698,9 @@ func TestMeshCombinedMode(t *testing.T) {
 			default:
 				allConnected := true
 				for _, ep := range endpoints {
-					ep.routingTable.mu.RLock()
-					peerCount := len(ep.routingTable.peerInfo)
-					ep.routingTable.mu.RUnlock()
+					ep.routingTable.Mu.RLock()
+					peerCount := len(ep.routingTable.PeerInfo)
+					ep.routingTable.Mu.RUnlock()
 					if peerCount < 4 {
 						allConnected = false
 					}

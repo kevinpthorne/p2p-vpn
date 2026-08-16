@@ -202,7 +202,7 @@ We package and host the Helm chart as an OCI registry artifact on GHCR.
 
 **Install the Helm Chart**:
 ```bash
-helm install my-vpn oci://ghcr.io/kevinpthorne/charts/p2p-vpn --version 0.2.0 \
+helm install my-vpn oci://ghcr.io/kevinpthorne/charts/p2p-vpn --version 1.0.0 \
   --set mode=endpoint \
   --set cluster=my-vpn-cluster \
   --set tunIp=10.200.0.1/24 \

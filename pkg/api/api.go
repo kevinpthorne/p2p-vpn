@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"bufio"
@@ -23,11 +23,14 @@ import (
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/google/uuid"
+	"github.com/kevinpthorne/p2p-vpn/gui"
+	"github.com/kevinpthorne/p2p-vpn/pkg/pki"
+	"github.com/kevinpthorne/p2p-vpn/pkg/vpn"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/kevinpthorne/p2p-vpn/gui"
 )
 
 // --- Profile structures ---
@@ -55,24 +58,24 @@ type ProfileList struct {
 
 // --- Global API and VPN Control State ---
 var (
-	apiActiveProfile     *Profile
-	apiSelectedProfileID string
-	apiVPNContext        context.Context
-	apiVPNCancel         context.CancelFunc
-	apiVPNMutex          sync.Mutex
-	apiVPNUptimeStart    time.Time
-	apiActiveIP          string
-	apiActiveCluster     string
-	apiActiveMode        string
-	apiActivePeerID      string
+	ApiActiveProfile     *Profile
+	ApiSelectedProfileID string
+	ApiVPNContext        context.Context
+	ApiVPNCancel         context.CancelFunc
+	ApiVPNMutex          sync.Mutex
+	ApiVPNUptimeStart    time.Time
+	ApiActiveIP          string
+	ApiActiveCluster     string
+	ApiActiveMode        string
+	ApiActivePeerID      string
 
 	// Bandwidth tracking
-	lastRxBytes     uint64
-	lastTxBytes     uint64
-	lastSpeedTime   time.Time
+	lastRxBytes      uint64
+	lastTxBytes      uint64
+	lastSpeedTime    time.Time
 	currentDownSpeed float64
 	currentUpSpeed   float64
-	speedMutex      sync.Mutex
+	speedMutex       sync.Mutex
 )
 
 // --- Log Interception & SSE System ---
@@ -190,8 +193,8 @@ func StartAPIServer(host string, port int, certFile, keyFile string, shouldOpenB
 			now := time.Now()
 			elapsed := now.Sub(lastSpeedTime).Seconds()
 			if elapsed > 0 {
-				rx := atomic.LoadUint64(&TotalRxBytes)
-				tx := atomic.LoadUint64(&TotalTxBytes)
+				rx := atomic.LoadUint64(&vpn.TotalRxBytes)
+				tx := atomic.LoadUint64(&vpn.TotalTxBytes)
 
 				currentDownSpeed = float64(rx-lastRxBytes) / elapsed
 				currentUpSpeed = float64(tx-lastTxBytes) / elapsed
@@ -251,7 +254,7 @@ func StartAPIServer(host string, port int, certFile, keyFile string, shouldOpenB
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	log.Printf("🌐 Built-in Web Server starting at %s://%s/", scheme, addr)
-	
+
 	// Open default browser automatically
 	if shouldOpenBrowser {
 		browserHost := host
@@ -281,13 +284,13 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiVPNMutex.Lock()
-	defer apiVPNMutex.Unlock()
+	ApiVPNMutex.Lock()
+	defer ApiVPNMutex.Unlock()
 
-	connected := apiVPNCancel != nil
+	connected := ApiVPNCancel != nil
 	uptimeSec := 0
 	if connected {
-		uptimeSec = int(time.Since(apiVPNUptimeStart).Seconds())
+		uptimeSec = int(time.Since(ApiVPNUptimeStart).Seconds())
 	}
 
 	// Fetch speed stats
@@ -300,17 +303,17 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	var endpointsList []map[string]interface{}
 	var relaysList []map[string]interface{}
 
-	if connected && ActiveRoutingTable != nil {
-		ActiveRoutingTable.mu.RLock()
-		for pid, info := range ActiveRoutingTable.peerInfo {
+	if connected && vpn.ActiveRoutingTable != nil {
+		vpn.ActiveRoutingTable.Mu.RLock()
+		for pid, info := range vpn.ActiveRoutingTable.PeerInfo {
 			latency := -1
 			// Find latency if connected in libp2p network
-			if ActiveHost != nil {
-				conns := ActiveHost.Network().ConnsToPeer(pid)
+			if vpn.ActiveHost != nil {
+				conns := vpn.ActiveHost.Network().ConnsToPeer(pid)
 				if len(conns) > 0 {
 					// Dummy positive latency representation or fetch actual libp2p peerstore latency
 					latency = 12 // default representation fallback
-					peerstoreLatency := ActiveHost.Peerstore().LatencyEWMA(pid)
+					peerstoreLatency := vpn.ActiveHost.Peerstore().LatencyEWMA(pid)
 					if peerstoreLatency > 0 {
 						latency = int(peerstoreLatency.Milliseconds())
 					}
@@ -333,19 +336,19 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		}
-		ActiveRoutingTable.mu.RUnlock()
+		vpn.ActiveRoutingTable.Mu.RUnlock()
 	}
 
 	profileName := "None"
 	profileId := ""
-	if apiActiveProfile != nil {
-		profileName = apiActiveProfile.Name
-		profileId = apiActiveProfile.ID
-	} else if apiSelectedProfileID != "" {
+	if ApiActiveProfile != nil {
+		profileName = ApiActiveProfile.Name
+		profileId = ApiActiveProfile.ID
+	} else if ApiSelectedProfileID != "" {
 		list, err := loadProfiles()
 		if err == nil {
 			for _, p := range list.Profiles {
-				if p.ID == apiSelectedProfileID {
+				if p.ID == ApiSelectedProfileID {
 					profileName = p.Name
 					profileId = p.ID
 					break
@@ -358,10 +361,10 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"connected":         connected,
 		"active_profile":    profileName,
 		"active_profile_id": profileId,
-		"local_peer_id":     apiActivePeerID,
-		"virtual_ip":        apiActiveIP,
-		"cluster":           apiActiveCluster,
-		"mode":              apiActiveMode,
+		"local_peer_id":     ApiActivePeerID,
+		"virtual_ip":        ApiActiveIP,
+		"cluster":           ApiActiveCluster,
+		"mode":              ApiActiveMode,
 		"uptime_seconds":    uptimeSec,
 		"down_speed_bps":    downSpeed,
 		"up_speed_bps":      upSpeed,
@@ -383,17 +386,17 @@ func handleProfiles(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		// Default selected profile if empty and there is one
-		if apiSelectedProfileID == "" && len(list.Profiles) > 0 {
-			apiSelectedProfileID = list.Profiles[0].ID
-			apiVPNMutex.Lock()
-			if apiVPNCancel == nil {
-				apiActiveProfile = new(Profile)
-				*apiActiveProfile = list.Profiles[0]
-				apiActiveIP = list.Profiles[0].TunIP
-				apiActiveCluster = list.Profiles[0].ClusterID
-				apiActiveMode = list.Profiles[0].Mode
+		if ApiSelectedProfileID == "" && len(list.Profiles) > 0 {
+			ApiSelectedProfileID = list.Profiles[0].ID
+			ApiVPNMutex.Lock()
+			if ApiVPNCancel == nil {
+				ApiActiveProfile = new(Profile)
+				*ApiActiveProfile = list.Profiles[0]
+				ApiActiveIP = list.Profiles[0].TunIP
+				ApiActiveCluster = list.Profiles[0].ClusterID
+				ApiActiveMode = list.Profiles[0].Mode
 			}
-			apiVPNMutex.Unlock()
+			ApiVPNMutex.Unlock()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(list)
@@ -500,16 +503,16 @@ func handleProfilesActive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiVPNMutex.Lock()
-	if apiVPNCancel == nil {
-		apiActiveProfile = new(Profile)
-		*apiActiveProfile = *target
-		apiActiveIP = target.TunIP
-		apiActiveCluster = target.ClusterID
-		apiActiveMode = target.Mode
+	ApiVPNMutex.Lock()
+	if ApiVPNCancel == nil {
+		ApiActiveProfile = new(Profile)
+		*ApiActiveProfile = *target
+		ApiActiveIP = target.TunIP
+		ApiActiveCluster = target.ClusterID
+		ApiActiveMode = target.Mode
 	}
-	apiSelectedProfileID = req.ProfileID
-	apiVPNMutex.Unlock()
+	ApiSelectedProfileID = req.ProfileID
+	ApiVPNMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -521,7 +524,7 @@ func writeSignatureFile(identityPath, sigPEM string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -530,7 +533,7 @@ func writeSignatureFile(identityPath, sigPEM string) (string, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	
+
 	filePath := filepath.Join(dir, fmt.Sprintf("%s.sig", pid))
 	err = os.WriteFile(filePath, []byte(strings.TrimSpace(sigPEM)), 0644)
 	if err != nil {
@@ -574,7 +577,7 @@ func getPeerIDFromKey(path string) (string, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return "", errors.New("file does not exist")
 	}
-	privKey, err := getIdentity(path)
+	privKey, err := vpn.GetIdentity(path)
 	if err != nil {
 		return "", err
 	}
@@ -607,7 +610,7 @@ func handleIdentityGenerate(w http.ResponseWriter, r *http.Request) {
 	// Remove old if any
 	_ = os.Remove(req.Path)
 
-	privKey, err := getIdentity(req.Path)
+	privKey, err := vpn.GetIdentity(req.Path)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -654,10 +657,10 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiVPNMutex.Lock()
-	defer apiVPNMutex.Unlock()
+	ApiVPNMutex.Lock()
+	defer ApiVPNMutex.Unlock()
 
-	if apiVPNCancel != nil {
+	if ApiVPNCancel != nil {
 		http.Error(w, "VPN is already running", http.StatusBadRequest)
 		return
 	}
@@ -690,20 +693,20 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Trigger VPN Thread launch
-	apiVPNContext, apiVPNCancel = context.WithCancel(context.Background())
-	apiActiveProfile = new(Profile)
-	*apiActiveProfile = *target
-	apiVPNUptimeStart = time.Now()
-	apiActiveIP = target.TunIP
-	apiActiveCluster = target.ClusterID
-	apiActiveMode = target.Mode
+	ApiVPNContext, ApiVPNCancel = context.WithCancel(context.Background())
+	ApiActiveProfile = new(Profile)
+	*ApiActiveProfile = *target
+	ApiVPNUptimeStart = time.Now()
+	ApiActiveIP = target.TunIP
+	ApiActiveCluster = target.ClusterID
+	ApiActiveMode = target.Mode
 
 	// Zero traffic counters
-	atomic.StoreUint64(&TotalRxBytes, 0)
-	atomic.StoreUint64(&TotalTxBytes, 0)
+	atomic.StoreUint64(&vpn.TotalRxBytes, 0)
+	atomic.StoreUint64(&vpn.TotalTxBytes, 0)
 
 	// Launch VPN in background routine
-	go runVPNDaemon(apiVPNContext, target)
+	go runVPNDaemon(ApiVPNContext, target)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -715,23 +718,23 @@ func handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiVPNMutex.Lock()
-	defer apiVPNMutex.Unlock()
+	ApiVPNMutex.Lock()
+	defer ApiVPNMutex.Unlock()
 
-	if apiVPNCancel == nil {
+	if ApiVPNCancel == nil {
 		http.Error(w, "VPN is not running", http.StatusBadRequest)
 		return
 	}
 
 	// Trigger cancellation
-	apiVPNCancel()
-	apiVPNCancel = nil
-	apiVPNContext = nil
-	apiActiveProfile = nil
-	apiActiveIP = ""
-	apiActiveCluster = ""
-	apiActiveMode = ""
-	apiActivePeerID = ""
+	ApiVPNCancel()
+	ApiVPNCancel = nil
+	ApiVPNContext = nil
+	ApiActiveProfile = nil
+	ApiActiveIP = ""
+	ApiActiveCluster = ""
+	ApiActiveMode = ""
+	ApiActivePeerID = ""
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -867,24 +870,33 @@ func handlePKISign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var msg []byte
-	if req.VirtualIP != "" {
-		msg = []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), req.VirtualIP))
-	} else {
-		msg = []byte(targetPeerID.String())
-	}
 	ctxBytes := []byte("p2p-vpn-auth")
-	sigBytes := make([]byte, mldsa87.SignatureSize)
-	err = mldsa87.SignTo(sk, msg, ctxBytes, true, sigBytes)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to sign Peer ID: %v", err), http.StatusInternalServerError)
+
+	// 1. Generate Base Signature
+	baseSigBytes := make([]byte, mldsa87.SignatureSize)
+	if err = mldsa87.SignTo(sk, []byte(targetPeerID.String()), ctxBytes, true, baseSigBytes); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to sign base Peer ID: %v", err), http.StatusInternalServerError)
 		return
 	}
-
 	sigPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "ML-DSA-87 SIGNATURE",
-		Bytes: sigBytes,
+		Bytes: baseSigBytes,
 	})
+
+	// 2. Generate Routing Signature if IP provided
+	if req.VirtualIP != "" {
+		routingMsg := []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), req.VirtualIP))
+		routingSigBytes := make([]byte, mldsa87.SignatureSize)
+		if err = mldsa87.SignTo(sk, routingMsg, ctxBytes, true, routingSigBytes); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to sign routing info: %v", err), http.StatusInternalServerError)
+			return
+		}
+		routingPEM := pem.EncodeToMemory(&pem.Block{
+			Type:  "ML-DSA-87 ROUTING SIGNATURE",
+			Bytes: routingSigBytes,
+		})
+		sigPEM = append(sigPEM, routingPEM...)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -897,10 +909,10 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	log.Printf("🚀 Starting VPN daemon for profile: %q", p.Name)
 
 	// Clean references from previous runs
-	ActiveHost = nil
-	ActiveDHT = nil
-	ActiveRoutingTable = nil
-	ActiveTun = nil
+	vpn.ActiveHost = nil
+	vpn.ActiveDHT = nil
+	vpn.ActiveRoutingTable = nil
+	vpn.ActiveTun = nil
 
 	// Overwrite or create Data Key file if a raw key string was pasted
 	dataKeyPath := ""
@@ -918,27 +930,21 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 		}
 	}
 
-	// 1. Initialize CAPubKey
-	CAPubKey = nil
+	// 1. Initialize pki.CAPubKey
+	pki.CAPubKey = nil
 	if p.CaKeyPath != "" {
-		pkBytes, err := readPublicKeyBytes(p.CaKeyPath)
+		pubKey, err := pki.ReadPublicKeyBytes(p.CaKeyPath)
 		if err != nil {
 			log.Printf("❌ Failed to read CA public key: %v", err)
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
-		pubKey := new(mldsa87.PublicKey)
-		if err := pubKey.UnmarshalBinary(pkBytes); err != nil {
-			log.Printf("❌ Invalid CA public key: %v", err)
-			cleanupActiveVPN()
-			return
-		}
-		CAPubKey = pubKey
+		pki.CAPubKey = pubKey
 		log.Println("🛡️ PKI Authentication ENABLED using CA Public Key")
 	}
 
 	// 2. Initialize Node Signature
-	NodeSignature = nil
+	pki.NodeSignature = nil
 	// Check signature content (either file path or PEM pasted content written to file)
 	sigPath := p.NodeSigContent
 	if sigPath != "" {
@@ -953,16 +959,16 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 		sigPEM, err := os.ReadFile(sigPath)
 		if err != nil {
 			log.Printf("❌ Failed to read node signature from %q: %v", sigPath, err)
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
-		sigBytes, err := decodeSignaturePEM(sigPEM)
+		sigBytes, err := pki.DecodeSignaturePEM(sigPEM)
 		if err != nil || len(sigBytes) == 0 {
 			log.Printf("❌ Failed to decode node signature: %v", err)
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
-		NodeSignature = sigBytes
+		pki.NodeSignature = sigBytes
 		log.Println("🛡️ Node Signature loaded for CA verification")
 	}
 
@@ -973,35 +979,35 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 			dataKeyHex, err := os.ReadFile(dataKeyPath)
 			if err != nil {
 				log.Printf("❌ Failed to read datakey: %v", err)
-				cleanupActiveVPN()
+				CleanupActiveVPN()
 				return
 			}
 			dataKey, err = hex.DecodeString(strings.TrimSpace(string(dataKeyHex)))
 			if err != nil {
 				log.Printf("❌ Invalid datakey hex: %v", err)
-				cleanupActiveVPN()
+				CleanupActiveVPN()
 				return
 			}
 			if len(dataKey) != 32 {
 				log.Printf("❌ Datakey must be 32 bytes (64 hex characters). Got %d bytes", len(dataKey))
-				cleanupActiveVPN()
+				CleanupActiveVPN()
 				return
 			}
-			if err := InitCipher(dataKey); err != nil {
+			if err := vpn.InitCipher(dataKey); err != nil {
 				log.Printf("❌ Failed to initialize cipher: %v", err)
-				cleanupActiveVPN()
+				CleanupActiveVPN()
 				return
 			}
 			log.Println("🔒 AES-256-GCM End-to-End Encryption ENABLED")
 		} else {
 			log.Println("❌ Endpoint mode requires a data key!")
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
 
 		if p.TunIP == "" {
 			log.Println("❌ Endpoint mode requires a virtual TUN IP/CIDR!")
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
 	}
@@ -1011,42 +1017,42 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	if identityPath == "" {
 		identityPath = fmt.Sprintf("identity-%s.key", p.Mode)
 	}
-	privKey, err := getIdentity(identityPath)
+	privKey, err := vpn.GetIdentity(identityPath)
 	if err != nil {
 		log.Printf("❌ Failed to load identity key: %v", err)
-		cleanupActiveVPN()
+		CleanupActiveVPN()
 		return
 	}
 
 	// 5. Setup TUN Interface
-	var tunIfce TunInterface
+	var tunIfce vpn.TunInterface
 	if p.Mode == "endpoint" {
 		if p.DryRun {
 			log.Println("📦 Dry-run mode enabled. Simulating TUN interface...")
-			tunIfce = NewMockTun("mock-tun0")
+			tunIfce = vpn.NewMockTun("mock-tun0")
 		} else {
 			var err error
-			tunIfce, err = NewRealTun()
+			tunIfce, err = vpn.NewRealTun()
 			if err != nil {
 				log.Printf("❌ Failed to create TUN interface: %v. Make sure to run as root (sudo).", err)
-				cleanupActiveVPN()
+				CleanupActiveVPN()
 				return
 			}
 		}
-		ActiveTun = tunIfce
+		vpn.ActiveTun = tunIfce
 
 		// Configure TUN device IP
 		if err := tunIfce.Configure(p.TunIP); err != nil {
 			log.Printf("❌ Failed to configure TUN interface: %v", err)
-			cleanupActiveVPN()
+			CleanupActiveVPN()
 			return
 		}
 		log.Printf("✅ TUN Interface %s configured with IP/CIDR %s", tunIfce.Name(), p.TunIP)
 	}
 
 	// 6. Setup Routing Table & Parse Subnets
-	routingTable := NewRoutingTable()
-	ActiveRoutingTable = routingTable
+	routingTable := vpn.NewRoutingTable()
+	vpn.ActiveRoutingTable = routingTable
 
 	var advertisedSubnets []string
 	if p.Advertise != "" {
@@ -1100,16 +1106,16 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	}
 
 	// 8. Make Libp2p Host
-	h, dhtObj, err := makeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers)
+	h, dhtObj, err := vpn.MakeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers)
 	if err != nil {
 		log.Printf("❌ Failed to initialize libp2p host: %v", err)
-		cleanupActiveVPN()
+		CleanupActiveVPN()
 		return
 	}
-	ActiveHost = h
-	ActiveDHT = dhtObj
+	vpn.ActiveHost = h
+	vpn.ActiveDHT = dhtObj
 
-	apiActivePeerID = h.ID().String()
+	ApiActivePeerID = h.ID().String()
 
 	log.Printf("---------------------------------------------")
 	log.Printf("P2P VPN Node Started. Mode: %s", strings.ToUpper(p.Mode))
@@ -1119,12 +1125,18 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	log.Printf("---------------------------------------------")
 
 	// 9. Connect to Relays
+	relayPeerIDs := make(map[peer.ID]bool)
 	if p.Mode == "endpoint" {
 		for _, rAddr := range p.RelayAddrs {
 			trimmed := strings.TrimSpace(rAddr)
 			if trimmed != "" {
-				log.Printf("🔌 Connecting to bootstrap relay: %s", trimmed)
-				connectToPeer(ctx, h, trimmed)
+				if p2pAddr, err := multiaddr.NewMultiaddr(trimmed); err == nil {
+					if info, err := peer.AddrInfoFromP2pAddr(p2pAddr); err == nil {
+						relayPeerIDs[info.ID] = true
+						h.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
+						vpn.ConnectToPeer(ctx, h, trimmed)
+					}
+				}
 			}
 		}
 	}
@@ -1133,23 +1145,23 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	log.Println("🔄 Bootstrapping Kademlia DHT...")
 	if err := dhtObj.Bootstrap(ctx); err != nil {
 		log.Printf("❌ DHT Bootstrap failed: %v", err)
-		cleanupActiveVPN()
+		CleanupActiveVPN()
 		return
 	}
 
 	// 11. Handshake Handlers
-	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
+	h.SetStreamHandler(vpn.HandshakeProtocol, func(s network.Stream) {
 		localVIP := ""
 		var localSubs []string
 		if p.Mode == "endpoint" {
 			localVIP = p.TunIP
 			localSubs = advertisedSubnets
 		}
-		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, p.DisableIPAuth)
+		vpn.HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth)
 	})
 
 	if p.Mode == "endpoint" {
-		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
+		h.SetStreamHandler(vpn.TunnelProtocol, func(s network.Stream) {
 			remotePeer := s.Conn().RemotePeer()
 			log.Printf("📥 Incoming tunnel data stream established from %s", remotePeer)
 
@@ -1158,7 +1170,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 			defer routingTable.ClearStreamIfMatches(remotePeer, s)
 
 			for {
-				packet, err := readFrame(s, dataKey)
+				packet, err := vpn.ReadFrame(s, dataKey)
 				if err != nil {
 					break
 				}
@@ -1179,7 +1191,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 			if routingTable.HasPeer(remotePeer) {
 				return
 			}
-			StartCAAuthKicker(ctx, h, routingTable, remotePeer, CAPubKey)
+			vpn.StartCAAuthKicker(ctx, h, routingTable, remotePeer, pki.CAPubKey)
 
 			localVIP := ""
 			var localSubs []string
@@ -1187,7 +1199,8 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 				localVIP = p.TunIP
 				localSubs = advertisedSubnets
 			}
-			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, p.DisableIPAuth)
+			isRelay := relayPeerIDs[remotePeer]
+			go vpn.PushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth, isRelay)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
@@ -1343,20 +1356,20 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 	log.Println("🛑 VPN engine shutdown complete.")
 }
 
-func cleanupActiveVPN() {
-	apiVPNMutex.Lock()
-	defer apiVPNMutex.Unlock()
-	
-	if apiVPNCancel != nil {
-		apiVPNCancel()
-		apiVPNCancel = nil
-		apiVPNContext = nil
+func CleanupActiveVPN() {
+	ApiVPNMutex.Lock()
+	defer ApiVPNMutex.Unlock()
+
+	if ApiVPNCancel != nil {
+		ApiVPNCancel()
+		ApiVPNCancel = nil
+		ApiVPNContext = nil
 	}
-	apiActiveProfile = nil
-	apiActiveIP = ""
-	apiActiveCluster = ""
-	apiActiveMode = ""
-	apiActivePeerID = ""
+	ApiActiveProfile = nil
+	ApiActiveIP = ""
+	ApiActiveCluster = ""
+	ApiActiveMode = ""
+	ApiActivePeerID = ""
 }
 
 // Helper: Open browser cross-platform

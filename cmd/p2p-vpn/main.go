@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"flag"
@@ -20,8 +19,12 @@ import (
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	"github.com/kevinpthorne/p2p-vpn/pkg/api"
+	"github.com/kevinpthorne/p2p-vpn/pkg/pki"
+	"github.com/kevinpthorne/p2p-vpn/pkg/vpn"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -69,12 +72,12 @@ func main() {
 	flag.Parse()
 
 	if *guiFlag {
-		StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, true)
+		api.StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, true)
 		return
 	}
 
 	if !*disableGuiFlag {
-		go StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, false)
+		go api.StartAPIServer(*guiHostFlag, *guiPortFlag, *guiCertFlag, *guiKeyFlag, false)
 	}
 
 	if *printPeerIDFlag {
@@ -82,7 +85,7 @@ func main() {
 		if identityPath == "" {
 			identityPath = fmt.Sprintf("identity-%s.key", *modeFlag)
 		}
-		privKey, err := getIdentity(identityPath)
+		privKey, err := vpn.GetIdentity(identityPath)
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to manage identity key: %v", err)
 		}
@@ -157,23 +160,31 @@ func main() {
 			log.Fatalf("❌ FATAL: Invalid CA private key format: %v", err)
 		}
 
-		var msg []byte
-		if *signIPFlag != "" {
-			msg = []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), *signIPFlag))
-		} else {
-			msg = []byte(targetPeerID.String())
-		}
 		ctxBytes := []byte("p2p-vpn-auth")
-		sigBytes := make([]byte, mldsa87.SignatureSize)
-		err = mldsa87.SignTo(sk, msg, ctxBytes, true, sigBytes)
-		if err != nil {
-			log.Fatalf("❌ FATAL: Failed to sign Peer ID: %v", err)
-		}
 
+		// 1. Generate Base Signature
+		baseSigBytes := make([]byte, mldsa87.SignatureSize)
+		if err = mldsa87.SignTo(sk, []byte(targetPeerID.String()), ctxBytes, true, baseSigBytes); err != nil {
+			log.Fatalf("❌ FATAL: Failed to sign base Peer ID: %v", err)
+		}
 		sigPEM := pem.EncodeToMemory(&pem.Block{
 			Type:  "ML-DSA-87 SIGNATURE",
-			Bytes: sigBytes,
+			Bytes: baseSigBytes,
 		})
+
+		// 2. Generate Routing Signature if IP provided
+		if *signIPFlag != "" {
+			routingMsg := []byte(fmt.Sprintf("%s|%s", targetPeerID.String(), *signIPFlag))
+			routingSigBytes := make([]byte, mldsa87.SignatureSize)
+			if err = mldsa87.SignTo(sk, routingMsg, ctxBytes, true, routingSigBytes); err != nil {
+				log.Fatalf("❌ FATAL: Failed to sign routing info: %v", err)
+			}
+			routingPEM := pem.EncodeToMemory(&pem.Block{
+				Type:  "ML-DSA-87 ROUTING SIGNATURE",
+				Bytes: routingSigBytes,
+			})
+			sigPEM = append(sigPEM, routingPEM...)
+		}
 
 		sigFileName := fmt.Sprintf("%s.sig", targetPeerID.String())
 		if err := os.WriteFile(sigFileName, sigPEM, 0644); err == nil {
@@ -194,20 +205,15 @@ func main() {
 			log.Fatalf("❌ FATAL: ca-verify mode requires the signature file path (-sig)")
 		}
 
-		pkBytes, err := readPublicKeyBytes(*caKeyPathFlag)
+		pk, err := pki.ReadPublicKeyBytes(*caKeyPathFlag)
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to read/parse CA public key: %v", err)
 		}
-		pk := new(mldsa87.PublicKey)
-		if err := pk.UnmarshalBinary(pkBytes); err != nil {
-			log.Fatalf("❌ FATAL: Invalid CA public key format: %v", err)
-		}
-
 		sigPEM, err := os.ReadFile(*sigPathFlag)
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to read signature file: %v", err)
 		}
-		sigBytes, err := decodeSignaturePEM(sigPEM)
+		sigBytes, err := pki.DecodeSignaturePEM(sigPEM)
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to decode signature: %v", err)
 		}
@@ -257,15 +263,11 @@ func main() {
 
 	// Load CA Public Key if configured
 	if *caKeyPathFlag != "" {
-		pkBytes, err := readPublicKeyBytes(*caKeyPathFlag)
+		pubKey, err := pki.ReadPublicKeyBytes(*caKeyPathFlag)
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to read CA public key from %q: %v", *caKeyPathFlag, err)
 		}
-		pubKey := new(mldsa87.PublicKey)
-		if err := pubKey.UnmarshalBinary(pkBytes); err != nil {
-			log.Fatalf("❌ FATAL: Invalid CA public key format: %v", err)
-		}
-		CAPubKey = pubKey
+		pki.CAPubKey = pubKey
 		log.Println("🛡️ PKI Authentication ENABLED using CA Public Key")
 	}
 
@@ -275,15 +277,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("❌ FATAL: Failed to read node signature file from %q: %v", *nodeSigPathFlag, err)
 		}
-		sigBytes, err := decodeSignaturePEM(sigPEM)
+		sigBytes, err := pki.DecodeSignaturePEM(sigPEM)
 		if err != nil || len(sigBytes) == 0 {
 			log.Fatalf("❌ FATAL: Failed to decode node signature: %v", err)
 		}
-		NodeSignature = sigBytes
+		pki.NodeSignature = sigBytes
 		log.Println("🛡️ Node Signature loaded for CA verification")
 	}
 
-	if CAPubKey != nil && len(NodeSignature) == 0 {
+	if pki.CAPubKey != nil && len(pki.NodeSignature) == 0 {
 		log.Println("⚠️ WARNING: CA public key is set, but no node signature (-node-sig) is configured. This node will be unable to authenticate to other CA-enforcing peers.")
 	}
 
@@ -302,7 +304,7 @@ func main() {
 			if len(dataKey) != 32 {
 				log.Fatalf("❌ FATAL: Datakey must be 32 bytes (64 hex characters). Got %d bytes", len(dataKey))
 			}
-			if err := InitCipher(dataKey); err != nil {
+			if err := vpn.InitCipher(dataKey); err != nil {
 				log.Fatalf("❌ FATAL: Failed to initialize fast cipher: %v", err)
 			}
 			log.Println("🔒 AES-256-GCM End-to-End Encryption ENABLED")
@@ -316,35 +318,35 @@ func main() {
 	}
 
 	// 2. Load Node Identity Private Key
-	privKey, err := getIdentity(identityPath)
+	privKey, err := vpn.GetIdentity(identityPath)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to manage identity key: %v", err)
 	}
 
 	// 3. Setup TUN Interface (if Endpoint)
-	var tunIfce TunInterface
+
 	if *modeFlag == "endpoint" {
 		if *dryRunFlag {
 			log.Println("📦 Dry-run mode enabled. Simulating TUN interface...")
-			tunIfce = NewMockTun("mock-tun0")
+			vpn.ActiveTun = vpn.NewMockTun("mock-tun0")
 		} else {
 			var err error
-			tunIfce, err = NewRealTun()
+			vpn.ActiveTun, err = vpn.NewRealTun()
 			if err != nil {
 				log.Fatalf("❌ FATAL: Failed to create TUN interface: %v.\n👉 Make sure to run as root (sudo) or run with -dry-run for testing.", err)
 			}
 		}
-		defer tunIfce.Close()
+		defer vpn.ActiveTun.Close()
 
 		// Configure TUN device IP
-		if err := tunIfce.Configure(*tunIPFlag); err != nil {
+		if err := vpn.ActiveTun.Configure(*tunIPFlag); err != nil {
 			log.Fatalf("❌ FATAL: Failed to configure TUN interface: %v", err)
 		}
-		log.Printf("✅ TUN Interface %s configured with IP/CIDR %s", tunIfce.Name(), *tunIPFlag)
+		log.Printf("✅ TUN Interface %s configured with IP/CIDR %s", vpn.ActiveTun.Name(), *tunIPFlag)
 	}
 
 	// 4. Setup Routing Table & Parse Subnets
-	routingTable := NewRoutingTable()
+	routingTable := vpn.NewRoutingTable()
 	var advertisedSubnets []string
 	if *advertiseFlag != "" {
 		for _, s := range strings.Split(*advertiseFlag, ",") {
@@ -416,30 +418,25 @@ func main() {
 		}
 	}
 
-	h, dhtObj, err := makeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
+	h, dhtObj, err := vpn.MakeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to initialize libp2p host: %v", err)
 	}
 	defer h.Close()
 
 	// Populate global active state for the API server telemetry
-	ActiveHost = h
-	ActiveDHT = dhtObj
-	ActiveRoutingTable = routingTable
-	ActiveTun = tunIfce
-	apiActiveIP = *tunIPFlag
-	apiActiveCluster = *clusterIDFlag
-	apiActiveMode = *modeFlag
-	apiActivePeerID = h.ID().String()
-	apiVPNUptimeStart = time.Now()
-	apiVPNContext = ctx
-	apiVPNCancel = cancel
+	vpn.ActiveHost = h
+	vpn.ActiveDHT = dhtObj
+	vpn.ActiveRoutingTable = routingTable
+	// API states are maintained in api package (or we skip them for CLI run if they are unexported)
+	// For now we set them if we export them, but they are unexported in api.go so we can't set them here.
+	// We will let startVPNFromProfile handle API state instead.
 
 	var relayAddrsList []string
 	if *relayAddrsFlag != "" {
 		relayAddrsList = strings.Split(*relayAddrsFlag, ",")
 	}
-	apiActiveProfile = &Profile{
+	api.ApiActiveProfile = &api.Profile{
 		ID:               "cli",
 		Name:             "CLI Session",
 		Mode:             *modeFlag,
@@ -462,6 +459,8 @@ func main() {
 	log.Printf("Cluster ID: %s", *clusterIDFlag)
 	log.Printf("---------------------------------------------")
 
+	relayPeerIDs := make(map[peer.ID]bool)
+
 	// 6. Connect to Bootstrap Relays
 	if *modeFlag == "endpoint" {
 		if len(relayAddrs) == 0 {
@@ -470,13 +469,17 @@ func main() {
 			for _, rAddr := range relayAddrs {
 				trimmed := strings.TrimSpace(rAddr)
 				if trimmed != "" {
-					log.Printf("🔌 Connecting to bootstrap relay: %s", trimmed)
-					connectToPeer(ctx, h, trimmed)
+					if p2pAddr, err := multiaddr.NewMultiaddr(trimmed); err == nil {
+						if info, err := peer.AddrInfoFromP2pAddr(p2pAddr); err == nil {
+							relayPeerIDs[info.ID] = true
+							h.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
+							vpn.ConnectToPeer(ctx, h, trimmed)
+						}
+					}
 				}
 			}
 		}
 	}
-
 	// 7. Bootstrap DHT
 	log.Println("🔄 Bootstrapping Kademlia DHT...")
 	if err := dhtObj.Bootstrap(ctx); err != nil {
@@ -484,37 +487,37 @@ func main() {
 	}
 
 	// 8. VPN Handshake and Connection Handlers (Active on both Relay and Endpoint)
-	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
+	h.SetStreamHandler(vpn.HandshakeProtocol, func(s network.Stream) {
 		localVIP := ""
 		var localSubs []string
 		if *modeFlag == "endpoint" {
 			localVIP = *tunIPFlag
 			localSubs = advertisedSubnets
 		}
-		HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, *disableIPAuthFlag)
+		vpn.HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag)
 	})
 
 	if *modeFlag == "endpoint" {
 		// Tunnel Data Stream Handler: Decrypts frames and writes packets to TUN (Endpoint Only)
-		h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
+		h.SetStreamHandler(vpn.TunnelProtocol, func(s network.Stream) {
 			remotePeer := s.Conn().RemotePeer()
 			log.Printf("📥 Incoming tunnel data stream established from %s", remotePeer)
 
 			// Cache this inbound stream in our routing table to write to it!
-			routingTable.SetStream(remotePeer, s)
+			vpn.ActiveRoutingTable.SetStream(remotePeer, s)
 
 			defer s.Close()
-			defer routingTable.ClearStreamIfMatches(remotePeer, s)
+			defer vpn.ActiveRoutingTable.ClearStreamIfMatches(remotePeer, s)
 
 			for {
-				packet, err := readFrame(s, dataKey)
+				packet, err := vpn.ReadFrame(s, dataKey)
 				if err != nil {
 					if err != io.EOF {
 						log.Printf("⚠️ Stream read error from %s: %v", remotePeer, err)
 					}
 					break
 				}
-				if _, err := tunIfce.Write(packet); err != nil {
+				if _, err := vpn.ActiveTun.Write(packet); err != nil {
 					log.Printf("⚠️ Failed to inject packet to TUN interface: %v", err)
 				}
 			}
@@ -526,12 +529,12 @@ func main() {
 		ConnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
 			log.Printf("🔌 Connected to peer: %s", remotePeer)
-			if routingTable.HasPeer(remotePeer) {
+			if vpn.ActiveRoutingTable.HasPeer(remotePeer) {
 				log.Printf("🤝 Peer %s already registered. Skipping handshake push.", remotePeer)
 				return
 			}
 			// Start the CA authentication timeout kicker if PKI is enabled
-			StartCAAuthKicker(ctx, h, routingTable, remotePeer, CAPubKey)
+			vpn.StartCAAuthKicker(ctx, h, vpn.ActiveRoutingTable, remotePeer, pki.CAPubKey)
 
 			// Initiate routing info handshake (outbound)
 			localVIP := ""
@@ -540,16 +543,17 @@ func main() {
 				localVIP = *tunIPFlag
 				localSubs = advertisedSubnets
 			}
-			go pushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, CAPubKey, NodeSignature, *disableIPAuthFlag)
+			isRelay := relayPeerIDs[remotePeer]
+			go vpn.PushHandshake(ctx, h, remotePeer, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag, isRelay)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
 			log.Printf("❌ Disconnected from peer: %s", remotePeer)
-			virtualIP, subnets := routingTable.UnregisterPeer(remotePeer)
-			if virtualIP != "" && tunIfce != nil {
+			virtualIP, subnets := vpn.ActiveRoutingTable.UnregisterPeer(remotePeer)
+			if virtualIP != "" && vpn.ActiveTun != nil {
 				log.Printf("🧹 Cleaning up routes for disconnected peer %s", remotePeer)
 				for _, s := range subnets {
-					tunIfce.DeleteRoute(s)
+					vpn.ActiveTun.DeleteRoute(s)
 				}
 			}
 		},
@@ -637,7 +641,7 @@ func main() {
 			log.Println("🚀 TUN Reader Loop running...")
 			buf := make([]byte, 2048)
 			for {
-				n, err := tunIfce.Read(buf)
+				n, err := vpn.ActiveTun.Read(buf)
 				if err != nil {
 					log.Printf("⚠️ Error reading from TUN interface: %v", err)
 					time.Sleep(1 * time.Second)
@@ -656,7 +660,7 @@ func main() {
 				}
 				destIP := net.IP(packet[16:20])
 
-				peerID, found := routingTable.LookupPeer(destIP)
+				peerID, found := vpn.ActiveRoutingTable.LookupPeer(destIP)
 				if !found {
 					// Packet destination has no matching peer route, drop silently
 					continue
@@ -667,7 +671,7 @@ func main() {
 				copy(pktCopy, packet)
 
 				// Push to peer worker queue
-				q := routingTable.GetOrCreateQueue(peerID, ctx, h, dataKey, tunIfce)
+				q := vpn.ActiveRoutingTable.GetOrCreateQueue(peerID, ctx, h, dataKey, vpn.ActiveTun)
 				select {
 				case q <- pktCopy:
 				default:
@@ -687,19 +691,19 @@ func main() {
 						continue
 					}
 
-					routingTable.mu.RLock()
-					if len(routingTable.peerInfo) == 0 {
+					vpn.ActiveRoutingTable.Mu.RLock()
+					if len(vpn.ActiveRoutingTable.PeerInfo) == 0 {
 						log.Println("⚠️ Cannot send packet: no remote peers discovered yet.")
-						routingTable.mu.RUnlock()
+						vpn.ActiveRoutingTable.Mu.RUnlock()
 						continue
 					}
 
-					var targetRoutes *PeerRoutes
-					for _, routes := range routingTable.peerInfo {
+					var targetRoutes *vpn.PeerRoutes
+					for _, routes := range vpn.ActiveRoutingTable.PeerInfo {
 						targetRoutes = routes
 						break
 					}
-					routingTable.mu.RUnlock()
+					vpn.ActiveRoutingTable.Mu.RUnlock()
 
 					localIP, _, _ := net.ParseCIDR(*tunIPFlag)
 					remoteIP, _, _ := net.ParseCIDR(targetRoutes.VirtualIP)
@@ -709,8 +713,8 @@ func main() {
 						continue
 					}
 
-					pkt := makeMockUDPPacket(localIP, remoteIP, []byte(text))
-					if mock, ok := tunIfce.(*MockTun); ok {
+					pkt := vpn.MakeMockUDPPacket(localIP, remoteIP, []byte(text))
+					if mock, ok := vpn.ActiveTun.(*vpn.MockTun); ok {
 						log.Printf("🚀 Injecting mock UDP packet (src: %s, dev-tun, dst: %s, payload: %q)", localIP, remoteIP, text)
 						mock.InjectPacket(pkt)
 					}
@@ -730,58 +734,13 @@ func main() {
 	}
 
 	log.Println("🧹 Shutting down... Cleaning up routes and interfaces")
-	cleanupActiveVPN()
-	if *modeFlag == "endpoint" && tunIfce != nil {
+	api.CleanupActiveVPN()
+	if *modeFlag == "endpoint" && vpn.ActiveTun != nil {
 		// Cleanup routing table routes
-		_, _ = routingTable.UnregisterPeer("") // clean any local references if possible
+		_, _ = vpn.ActiveRoutingTable.UnregisterPeer("") // clean any local references if possible
 		// Ensure we clean up routes manually or let OS clean when TUN closes
 		log.Println("👋 Closing TUN interface...")
-		tunIfce.Close()
+		vpn.ActiveTun.Close()
 	}
 	log.Println("🛑 Shutdown complete.")
 }
-
-func makeMockUDPPacket(srcIP, destIP net.IP, payload []byte) []byte {
-	totalLen := 20 + 8 + len(payload)
-	pkt := make([]byte, totalLen)
-
-	// IP Header
-	pkt[0] = 0x45
-	pkt[1] = 0x00
-	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
-	binary.BigEndian.PutUint16(pkt[4:6], 0)
-	binary.BigEndian.PutUint16(pkt[6:8], 0x4000)
-	pkt[8] = 64
-	pkt[9] = 17 // UDP
-	copy(pkt[12:16], srcIP.To4())
-	copy(pkt[16:20], destIP.To4())
-
-	// UDP Header
-	binary.BigEndian.PutUint16(pkt[20:22], 12345) // Src Port
-	binary.BigEndian.PutUint16(pkt[22:24], 9999)  // Dest Port
-	binary.BigEndian.PutUint16(pkt[24:26], uint16(8+len(payload)))
-	binary.BigEndian.PutUint16(pkt[26:28], 0)
-
-	// Payload
-	copy(pkt[28:], payload)
-
-	return pkt
-}
-
-func readPublicKeyBytes(path string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "ML-DSA-87 PUBLIC KEY" {
-		// Fallback to raw hex
-		str := strings.TrimSpace(string(data))
-		if hb, err := hex.DecodeString(str); err == nil {
-			return hb, nil
-		}
-		return data, nil
-	}
-	return block.Bytes, nil
-}
-

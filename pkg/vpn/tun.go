@@ -1,4 +1,4 @@
-package main
+package vpn
 
 import (
 	"fmt"
@@ -47,8 +47,6 @@ func (r *RealTun) Close() error {
 func (r *RealTun) Name() string {
 	return r.ifce.Name()
 }
-
-
 
 // MockTun acts as a dry-run mock TUN interface
 type MockTun struct {
