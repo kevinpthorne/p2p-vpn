@@ -66,7 +66,7 @@ func setupTestNode(
 
 	// Set symmetric Handshake Handler
 	h.SetStreamHandler(HandshakeProtocol, func(s network.Stream) {
-		HandleIncomingHandshake(nodeCtx, h, s, virtualIP, advertiseSubnets, rt, tunIfce, caPub, nodeSig, false)
+		HandleIncomingHandshake(nodeCtx, h, s, mode, virtualIP, advertiseSubnets, rt, tunIfce, caPub, nodeSig, false)
 	})
 
 	if mode == "endpoint" {
@@ -104,18 +104,18 @@ func setupTestNode(
 				localVIP = virtualIP
 				localSubs = advertiseSubnets
 			}
-			isRelay := false
+			
 			for _, rAddr := range relayAddrs {
 				if p2pAddr, err := multiaddr.NewMultiaddr(rAddr); err == nil {
 					if info, err := peer.AddrInfoFromP2pAddr(p2pAddr); err == nil {
 						if info.ID == remotePeer {
-							isRelay = true
+							
 							break
 						}
 					}
 				}
 			}
-			go PushHandshake(nodeCtx, h, remotePeer, localVIP, localSubs, rt, tunIfce, caPub, nodeSig, false, isRelay)
+			go PushHandshake(nodeCtx, h, remotePeer, mode, localVIP, localSubs, rt, tunIfce, caPub, nodeSig, false)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()

@@ -495,7 +495,7 @@ func main() {
 			localVIP = *tunIPFlag
 			localSubs = advertisedSubnets
 		}
-		vpn.HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag)
+		vpn.HandleIncomingHandshake(ctx, h, s, *modeFlag, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag)
 	})
 
 	if *modeFlag == "endpoint" {
@@ -544,8 +544,8 @@ func main() {
 				localVIP = *tunIPFlag
 				localSubs = advertisedSubnets
 			}
-			isRelay := relayPeerIDs[remotePeer]
-			go vpn.PushHandshake(ctx, h, remotePeer, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag, isRelay)
+			
+			go vpn.PushHandshake(ctx, h, remotePeer, *modeFlag, localVIP, localSubs, vpn.ActiveRoutingTable, vpn.ActiveTun, pki.CAPubKey, pki.NodeSignature, *disableIPAuthFlag)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()

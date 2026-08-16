@@ -97,6 +97,11 @@ const (
 	HandshakeProtocol = "/p2p-vpn/handshake/1.0.0"
 )
 
+// HelloMessage is exchanged first to identify node roles before sending routing data
+type HelloMessage struct {
+	Mode string `json:"mode"` // "endpoint" or "relay"
+}
+
 // HandshakeMessage contains the routes and virtual IP details of an endpoint
 type HandshakeMessage struct {
 	VirtualIP string   `json:"virtual_ip"` // e.g. "10.200.0.1/24"
@@ -104,13 +109,32 @@ type HandshakeMessage struct {
 	Signature string   `json:"signature"`  // PEM or hex encoded ML-DSA-87 signature
 }
 
-func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
+func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream, localMode string, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
 	defer s.Close()
 	remotePeer := s.Conn().RemotePeer()
 	log.Printf("🤝 Incoming handshake stream from %s", remotePeer)
 
+	encoder := json.NewEncoder(s)
+	decoder := json.NewDecoder(s)
+
+	// Step 1: Exchange Hello
+	var helloIn HelloMessage
+	if err := decoder.Decode(&helloIn); err != nil {
+		log.Printf("⚠️ Failed to parse handshake hello from %s: %v", remotePeer, err)
+		return
+	}
+
+	helloOut := HelloMessage{Mode: localMode}
+	if err := encoder.Encode(&helloOut); err != nil {
+		log.Printf("⚠️ Handshake hello encoding failed: %v", err)
+		return
+	}
+
+	hideIP := (helloIn.Mode == "relay")
+
+	// Step 2: Read initiator's HandshakeMessage
 	var msg HandshakeMessage
-	if err := json.NewDecoder(s).Decode(&msg); err != nil {
+	if err := decoder.Decode(&msg); err != nil {
 		log.Printf("⚠️ Failed to parse handshake message from %s: %v", remotePeer, err)
 		return
 	}
@@ -183,12 +207,7 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 		routingTable.RegisterPeer(remotePeer, "", nil)
 	}
 
-	hideIP := false
-	if msg.VirtualIP == "" {
-		hideIP = true // The other side is hiding their IP (relay), we must do the same
-	}
-
-	// Respond back with our own routing information
+	// Step 3: Write our HandshakeMessage
 	respVIP := localVirtualIP
 	respSubs := localSubnets
 	if hideIP {
@@ -200,16 +219,16 @@ func HandleIncomingHandshake(ctx context.Context, h host.Host, s network.Stream,
 	if len(localSignature) > 0 {
 		respSig = pki.SelectSignatureForHandshake(localSignature, hideIP)
 	}
-	resp := HandshakeMessage{
+	respMsg := HandshakeMessage{
 		VirtualIP: respVIP,
 		Subnets:   respSubs,
 		Signature: respSig,
 	}
-	if err := json.NewEncoder(s).Encode(&resp); err != nil {
-		log.Printf("⚠️ Failed to encode response handshake to %s: %v", remotePeer, err)
-		return
+
+	if err := encoder.Encode(&respMsg); err != nil {
+		log.Printf("⚠️ Handshake response encoding failed: %v", err)
 	}
-	log.Printf("✅ Bidirectional handshake response successfully sent to %s", remotePeer)
+	log.Printf("✅ Handshake successfully completed with %s", remotePeer)
 }
 
 // PeerRoutes holds routing information for a remote peer
@@ -637,7 +656,7 @@ func ConnectToPeer(ctx context.Context, h host.Host, target string) {
 }
 
 // Handshake execution
-func PushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool, isRelay bool) {
+func PushHandshake(ctx context.Context, h host.Host, pid peer.ID, localMode string, localVirtualIP string, localSubnets []string, routingTable *RoutingTable, tunIfce TunInterface, caPubKey *mldsa87.PublicKey, localSignature []byte, disableIPAuth bool) {
 	log.Printf("🤝 Sending routing handshake to peer %s", pid)
 	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -650,9 +669,25 @@ func PushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 	}
 	defer s.Close()
 
-	// 1. Write our handshake
-	hideIP := isRelay
+	encoder := json.NewEncoder(s)
+	decoder := json.NewDecoder(s)
 
+	// Step 1: Exchange Hello
+	helloOut := HelloMessage{Mode: localMode}
+	if err := encoder.Encode(&helloOut); err != nil {
+		log.Printf("⚠️ Handshake hello encoding failed: %v", err)
+		return
+	}
+
+	var helloIn HelloMessage
+	if err := decoder.Decode(&helloIn); err != nil {
+		log.Printf("⚠️ Handshake hello decoding failed: %v", err)
+		return
+	}
+
+	hideIP := (helloIn.Mode == "relay")
+
+	// Step 2: Write our HandshakeMessage
 	reqVIP := localVirtualIP
 	reqSubs := localSubnets
 	if hideIP {
@@ -670,15 +705,13 @@ func PushHandshake(ctx context.Context, h host.Host, pid peer.ID, localVirtualIP
 		Signature: localSig,
 	}
 
-	encoder := json.NewEncoder(s)
 	if err := encoder.Encode(&msg); err != nil {
 		log.Printf("⚠️ Handshake encoding failed: %v", err)
 		return
 	}
 
-	// 2. Read responder's handshake response
+	// Step 3: Read responder's HandshakeMessage
 	var respMsg HandshakeMessage
-	decoder := json.NewDecoder(s)
 	if err := decoder.Decode(&respMsg); err != nil {
 		log.Printf("⚠️ Handshake response decoding failed from %s: %v", pid, err)
 		return

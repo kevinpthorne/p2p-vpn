@@ -1157,7 +1157,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 			localVIP = p.TunIP
 			localSubs = advertisedSubnets
 		}
-		vpn.HandleIncomingHandshake(ctx, h, s, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth)
+		vpn.HandleIncomingHandshake(ctx, h, s, p.Mode, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth)
 	})
 
 	if p.Mode == "endpoint" {
@@ -1199,8 +1199,8 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 				localVIP = p.TunIP
 				localSubs = advertisedSubnets
 			}
-			isRelay := relayPeerIDs[remotePeer]
-			go vpn.PushHandshake(ctx, h, remotePeer, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth, isRelay)
+			
+			go vpn.PushHandshake(ctx, h, remotePeer, p.Mode, localVIP, localSubs, routingTable, tunIfce, pki.CAPubKey, pki.NodeSignature, p.DisableIPAuth)
 		},
 		DisconnectedF: func(n network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
