@@ -94,7 +94,7 @@ jobs:
 
       - name: Publish Helm Chart to GHCR
         run: |
-          CHART_VERSION="1.0.0"
+          CHART_VERSION="1.0.1"
           APP_VERSION="latest"
           
           # If it's a tag, use the tag as version

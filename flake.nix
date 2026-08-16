@@ -20,7 +20,7 @@
         # Define native package (for devShell and default binary of the host platform)
         p2p-vpn-native = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn";
-          version = "1.0.0";
+          version = "1.0.1";
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
@@ -125,7 +125,7 @@
         # Build for Windows amd64 using Go's native cross-compilation capabilities
         p2p-vpn-windows = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn-windows";
-          version = "1.0.0";
+          version = "1.0.1";
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
