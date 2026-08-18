@@ -48,8 +48,14 @@ type Profile struct {
 	CaKeyPath        string   `json:"ca_key_path"`
 	NodeSigContent   string   `json:"node_sig_content"`
 	AllowedPeersPath string   `json:"allowed_peers_path"`
-	RelayAddrs       []string `json:"relay_addrs"`
-	DisableIPAuth    bool     `json:"disable_ip_auth"`
+	RelayAddrs                 []string `json:"relay_addrs"`
+	DisableIPAuth              bool     `json:"disable_ip_auth"`
+	RelayMaxReservations       int      `json:"relay_max_reservations"`
+	RelayMaxReservationsPerIP  int      `json:"relay_max_reservations_per_ip"`
+	RelayMaxReservationsPerASN int      `json:"relay_max_reservations_per_asn"`
+	AutoRelayBackoff           int      `json:"autorelay_backoff"`
+	AutoRelayBootDelay         int      `json:"autorelay_boot_delay"`
+	AutoRelayMinCandidates     int      `json:"autorelay_min_candidates"`
 }
 
 type ProfileList struct {
@@ -1105,8 +1111,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 		}
 	}
 
-	// 8. Make Libp2p Host
-	h, dhtObj, err := vpn.MakeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers)
+	h, dhtObj, err := vpn.MakeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers, p.RelayMaxReservations, p.RelayMaxReservationsPerIP, p.RelayMaxReservationsPerASN, p.AutoRelayBackoff, p.AutoRelayBootDelay, p.AutoRelayMinCandidates)
 	if err != nil {
 		log.Printf("❌ Failed to initialize libp2p host: %v", err)
 		CleanupActiveVPN()

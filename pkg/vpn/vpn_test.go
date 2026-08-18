@@ -45,7 +45,7 @@ func setupTestNode(
 	virtualIP string,
 	advertiseSubnets []string,
 ) *TestNode {
-	h, dhtObj, err := MakeHost(ctx, mode, privKey, relayAddrs, port, clusterID, allowedPeers)
+	h, dhtObj, err := MakeHost(ctx, mode, privKey, relayAddrs, port, clusterID, allowedPeers, 1024, 1024, 1024, 15, 5, 4)
 	if err != nil {
 		t.Fatalf("failed to start %s host: %v", mode, err)
 	}

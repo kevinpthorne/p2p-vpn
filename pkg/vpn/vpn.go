@@ -27,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -553,7 +554,7 @@ func ReadFrame(r io.Reader, key []byte) ([]byte, error) {
 	return payload, err
 }
 
-func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID) (host.Host, *dht.IpfsDHT, error) {
+func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID, relayMaxReservations, relayMaxReservationsPerIP, relayMaxReservationsPerASN, autorelayBackoff, autorelayBootDelay, autorelayMinCandidates int) (host.Host, *dht.IpfsDHT, error) {
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 	udpListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 
@@ -579,15 +580,37 @@ func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAdd
 	if mode == "relay" {
 		resources := relay.DefaultResources()
 		resources.Limit = nil // Disable data caps and duration limits on relayed connections
+		if relayMaxReservations > 0 {
+			resources.MaxReservations = relayMaxReservations
+		}
+		if relayMaxReservationsPerIP > 0 {
+			resources.MaxReservationsPerIP = relayMaxReservationsPerIP
+		}
+		if relayMaxReservationsPerASN > 0 {
+			resources.MaxReservationsPerASN = relayMaxReservationsPerASN
+		}
 		opts = append(opts,
 			libp2p.ForceReachabilityPublic(),
 			libp2p.EnableRelayService(relay.WithResources(resources)),
 			libp2p.EnableNATService(),
 		)
 	} else {
+		if autorelayBackoff <= 0 {
+			autorelayBackoff = 15
+		}
+		if autorelayBootDelay <= 0 {
+			autorelayBootDelay = 5
+		}
+		if autorelayMinCandidates <= 0 {
+			autorelayMinCandidates = 4
+		}
 		opts = append(opts,
 			libp2p.ForceReachabilityPrivate(),
-			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
+			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers,
+				autorelay.WithBackoff(time.Duration(autorelayBackoff)*time.Second),
+				autorelay.WithBootDelay(time.Duration(autorelayBootDelay)*time.Second),
+				autorelay.WithMinCandidates(autorelayMinCandidates),
+				autorelay.WithMinInterval(10*time.Second)),
 			libp2p.EnableHolePunching(),
 		)
 	}

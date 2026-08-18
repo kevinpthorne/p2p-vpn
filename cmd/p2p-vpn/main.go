@@ -43,6 +43,15 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func getEnvInt(key string, defaultValue int) int {
+	if val, ok := os.LookupEnv(key); ok {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
 func main() {
 	// --- CLI Flags & Environment Overrides ---
 	modeFlag := flag.String("mode", getEnv("P2P_VPN_MODE", "endpoint"), "Operational mode: 'relay', 'endpoint', 'ca-keygen', 'ca-sign', or 'ca-verify'")
@@ -57,6 +66,12 @@ func main() {
 	allowedPeersFlag := flag.String("allowed-peers", getEnv("P2P_VPN_ALLOWED_PEERS", ""), "Path to file containing allowed Peer IDs (one per line) for Connection Gater")
 	caKeyPathFlag := flag.String("ca-key", getEnv("P2P_VPN_CA_KEY", ""), "Path to the PEM-encoded CA public key file")
 	nodeSigPathFlag := flag.String("node-sig", getEnv("P2P_VPN_NODE_SIG", ""), "Path to this node's PEM-encoded signature file")
+	relayMaxResFlag := flag.Int("relay-max-reservations", getEnvInt("P2P_VPN_RELAY_MAX_RES", 128), "Max total endpoints the relay will support")
+	relayMaxResPerIPFlag := flag.Int("relay-max-reservations-per-ip", getEnvInt("P2P_VPN_RELAY_MAX_RES_PER_IP", 8), "Max endpoints per IP the relay will support")
+	relayMaxResPerASNFlag := flag.Int("relay-max-reservations-per-asn", getEnvInt("P2P_VPN_RELAY_MAX_RES_PER_ASN", 32), "Max endpoints per ASN the relay will support")
+	autorelayBackoffFlag := flag.Int("autorelay-backoff", getEnvInt("P2P_VPN_AUTORELAY_BACKOFF", 15), "AutoRelay backoff time in seconds")
+	autorelayBootDelayFlag := flag.Int("autorelay-boot-delay", getEnvInt("P2P_VPN_AUTORELAY_BOOT_DELAY", 5), "AutoRelay boot delay in seconds")
+	autorelayMinCandidatesFlag := flag.Int("autorelay-min-candidates", getEnvInt("P2P_VPN_AUTORELAY_MIN_CANDIDATES", 4), "AutoRelay minimum candidates")
 	caKeyPrivPathFlag := flag.String("ca-key-priv", "", "Path to the CA's PEM-encoded private key file (for ca-sign mode)")
 	peerIDFlag := flag.String("peer", "", "Target Peer ID to sign (for ca-sign mode)")
 	signIPFlag := flag.String("sign-ip", "", "Virtual IP/CIDR to bind to the signature (optional)")
@@ -419,7 +434,7 @@ func main() {
 		}
 	}
 
-	h, dhtObj, err := vpn.MakeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers)
+	h, dhtObj, err := vpn.MakeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers, *relayMaxResFlag, *relayMaxResPerIPFlag, *relayMaxResPerASNFlag, *autorelayBackoffFlag, *autorelayBootDelayFlag, *autorelayMinCandidatesFlag)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to initialize libp2p host: %v", err)
 	}
@@ -438,20 +453,35 @@ func main() {
 		relayAddrsList = strings.Split(*relayAddrsFlag, ",")
 	}
 	api.ApiActiveProfile = &api.Profile{
-		ID:               "cli",
-		Name:             "CLI Session",
-		Mode:             *modeFlag,
-		ClusterID:        *clusterIDFlag,
-		Port:             finalPort,
-		DryRun:           *dryRunFlag,
-		TunIP:            *tunIPFlag,
-		Advertise:        *advertiseFlag,
-		IdentityPath:     identityPath,
-		CaKeyPath:        *caKeyPathFlag,
-		NodeSigContent:   *nodeSigPathFlag,
-		AllowedPeersPath: *allowedPeersFlag,
-		RelayAddrs:       relayAddrsList,
+		ID:                         "cli",
+		Name:                       "CLI Session",
+		Mode:                       *modeFlag,
+		ClusterID:                  *clusterIDFlag,
+		Port:                       finalPort,
+		TunIP:                      *tunIPFlag,
+		Advertise:                  *advertiseFlag,
+		RelayMaxReservations:       *relayMaxResFlag,
+		RelayMaxReservationsPerIP:  *relayMaxResPerIPFlag,
+		RelayMaxReservationsPerASN: *relayMaxResPerASNFlag,
+		AutoRelayBackoff:           *autorelayBackoffFlag,
+		AutoRelayBootDelay:         *autorelayBootDelayFlag,
+		AutoRelayMinCandidates:     *autorelayMinCandidatesFlag,
+		DryRun:                     *dryRunFlag,
+		IdentityPath:               identityPath,
+		CaKeyPath:                  *caKeyPathFlag,
+		NodeSigContent:             *nodeSigPathFlag,
+		AllowedPeersPath:           *allowedPeersFlag,
+		RelayAddrs:                 relayAddrsList,
+		DisableIPAuth:              *disableIPAuthFlag,
 	}
+
+	api.ApiVPNCancel = cancel
+	api.ApiVPNContext = ctx
+	api.ApiVPNUptimeStart = time.Now()
+	api.ApiActiveIP = *tunIPFlag
+	api.ApiActiveCluster = *clusterIDFlag
+	api.ApiActiveMode = *modeFlag
+	api.ApiActivePeerID = h.ID().String()
 
 	log.Printf("---------------------------------------------")
 	log.Printf("P2P VPN Node Started. Mode: %s", strings.ToUpper(*modeFlag))
