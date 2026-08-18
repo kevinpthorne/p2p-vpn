@@ -1037,7 +1037,8 @@ function initPKI() {
         
         const payload = {
             ca_priv_path: document.getElementById('sign-ca-priv').value.trim(),
-            peer_id: document.getElementById('sign-peer-id').value.trim()
+            peer_id: document.getElementById('sign-peer-id').value.trim(),
+            virtual_ip: document.getElementById('sign-virtual-ip').value.trim()
         };
         
         const res = await apiFetch('/api/pki/sign', {
