@@ -17,10 +17,12 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        version = "1.0.3";
+
         # Define native package (for devShell and default binary of the host platform)
         p2p-vpn-native = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn";
-          version = "1.0.2";
+          version = version;
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
@@ -55,7 +57,7 @@
 
         dockerImage-amd64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
-          tag = "latest-amd64";
+          tag = "${version}-amd64";
           architecture = "amd64";
 
           # scratch-like image containing only the compiled static Go binary
@@ -100,7 +102,7 @@
 
         dockerImage-arm64 = pkgs.dockerTools.buildImage {
           name = "p2p-vpn";
-          tag = "latest-arm64";
+          tag = "${version}-arm64";
           architecture = "arm64";
 
           # scratch-like image containing only the compiled static Go binary
@@ -125,7 +127,7 @@
         # Build for Windows amd64 using Go's native cross-compilation capabilities
         p2p-vpn-windows = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
           pname = "p2p-vpn-windows";
-          version = "1.0.2";
+          version = version;
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
           vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";

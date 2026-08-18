@@ -55,7 +55,8 @@ jobs:
           push_arch_images() {
             local arch=$1
             local tag=$2
-            docker tag "p2p-vpn:latest-$arch" "$IMAGE_NAME:$tag-$arch"
+            local version=$(nix eval --raw .#p2p-vpn.version)
+            docker tag "p2p-vpn:$version-$arch" "$IMAGE_NAME:$tag-$arch"
             docker push "$IMAGE_NAME:$tag-$arch"
           }
           
@@ -94,7 +95,7 @@ jobs:
 
       - name: Publish Helm Chart to GHCR
         run: |
-          CHART_VERSION="1.0.2"
+          CHART_VERSION=$(nix eval --raw .#p2p-vpn.version)
           APP_VERSION="latest"
           
           # If it's a tag, use the tag as version
