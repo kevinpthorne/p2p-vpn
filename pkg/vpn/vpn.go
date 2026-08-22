@@ -11,12 +11,12 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
+	"github.com/kevinpthorne/p2p-vpn/pkg/identity"
 	"github.com/kevinpthorne/p2p-vpn/pkg/pki"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -641,19 +641,24 @@ func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAdd
 }
 
 func GetIdentity(path string) (crypto.PrivKey, error) {
-	if _, err := os.Stat(path); err == nil {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			return crypto.UnmarshalPrivateKey(data)
-		}
+	tpmProvider := identity.NewTPMProvider()
+	if tpmPriv, err := tpmProvider.GetIdentity(); err == nil {
+		log.Printf("🔒 Using hardware-backed TPM identity")
+		return tpmPriv, nil
+	} else {
+		log.Printf("⚠️ TPM identity unavailable (%v).", err)
 	}
-	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		return nil, err
+
+	seProvider := identity.NewSecureEnclaveProvider()
+	if sePriv, err := seProvider.GetIdentity(); err == nil {
+		log.Printf("🔒 Using hardware-backed Secure Enclave identity")
+		return sePriv, nil
+	} else {
+		log.Printf("⚠️ Secure Enclave identity unavailable (%v). Falling back to file-based identity.", err)
 	}
-	data, _ := crypto.MarshalPrivateKey(priv)
-	os.WriteFile(path, data, 0600)
-	return priv, nil
+
+	fileProvider := identity.NewFileProvider(path)
+	return fileProvider.GetIdentity()
 }
 
 func protocolPrefixForCluster(clusterID string) protocol.ID {

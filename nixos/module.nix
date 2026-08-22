@@ -49,7 +49,8 @@ in {
     };
 
     dataKeyPath = mkOption {
-      type = types.path;
+      type = types.nullOr types.path;
+      default = null;
       description = "Path to the hex-encoded data key file.";
     };
 
@@ -82,6 +83,10 @@ in {
       {
         assertion = cfg.mode == "endpoint" -> (cfg.tunIp != "" && cfg.relay != "");
         message = "services.p2p-vpn: 'tunIp' and 'relay' must be set when using endpoint mode.";
+      }
+      {
+        assertion = cfg.mode == "endpoint" -> cfg.dataKeyPath != null;
+        message = "services.p2p-vpn: 'dataKeyPath' must be set when using endpoint mode.";
       }
       {
         assertion = cfg.mode == "relay" -> (cfg.tunIp == "" && cfg.relay == "");
@@ -117,10 +122,10 @@ in {
           args = [
             "-mode" cfg.mode
             "-cluster" cfg.cluster
-            "-datakey" cfg.dataKeyPath
             "-identity" cfg.identityPath
             "-port" (toString cfg.port)
-          ] ++ optionals (cfg.tunIp != "") [ "-tun-ip" cfg.tunIp ]
+          ] ++ optionals (cfg.dataKeyPath != null) [ "-datakey" cfg.dataKeyPath ]
+            ++ optionals (cfg.tunIp != "") [ "-tun-ip" cfg.tunIp ]
             ++ optionals (cfg.relay != "") [ "-relay" cfg.relay ]
             ++ optionals (cfg.advertise != "") [ "-advertise" cfg.advertise ]
             ++ optionals (cfg.caKey != null) [ "-ca-key" "/etc/p2p-vpn/ca.pub" ]

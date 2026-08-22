@@ -25,7 +25,7 @@
           version = version;
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
-          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
+          vendorHash = "sha256-U0DipYXziRVWCgatnPA8sRaih4sb/TtJbaf+OzYuGIM=";
           ldflags = [
             "-s"
             "-w"
@@ -130,7 +130,7 @@
           version = version;
           src = ./.;
           subPackages = [ "cmd/p2p-vpn" ];
-          vendorHash = "sha256-hHd9xwPjY1ucDt/WLEXpjOV8ipDmXQOBQTBnXqWZsJs=";
+          vendorHash = "sha256-U0DipYXziRVWCgatnPA8sRaih4sb/TtJbaf+OzYuGIM=";
           ldflags = [
             "-s"
             "-w"
