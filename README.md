@@ -193,7 +193,7 @@ docker run --rm -it \
   -e P2P_VPN_MODE=endpoint \
   -e P2P_VPN_CLUSTER=my-vpn-cluster \
   -e P2P_VPN_TUN_IP=10.200.0.1/24 \
-  -e P2P_VPN_RELAY="/ip4/1.2.3.4/tcp/4001/p2p/Qm..." \
+  -e P2P_VPN_RELAYS="/ip4/1.2.3.4/tcp/4001/p2p/Qm..." \
   ghcr.io/kevinpthorne/p2p-vpn:latest
 ```
 
@@ -230,7 +230,8 @@ All parameters can be configured using environment variables (especially useful 
 | `-port` | `P2P_VPN_PORT` | `0` (random) | Listening port (4001 default for relay) |
 | `-identity` | `P2P_VPN_IDENTITY` | `identity-<mode>.key` | Node identity key file path |
 | `-cluster` | `P2P_VPN_CLUSTER` | `my-k8s-cluster` | Cluster/Rendezvous namespace ID |
-| `-relay` | `P2P_VPN_RELAY` | `""` | Comma-separated bootstrap relay multiaddrs |
+| `-relays` | `P2P_VPN_RELAYS` | `""` | Comma-separated bootstrap relay multiaddrs |
+| `-ext-dns` | `P2P_VPN_EXT_DNS` | `""` | External DNS name to advertise in logs |
 | `-datakey` | `P2P_VPN_DATAKEY` | `""` | Path to the hex key file for GCM |
 | `-tun-ip` | `P2P_VPN_TUN_IP` | `""` | Virtual subnet IP/CIDR for the TUN interface |
 | `-advertise` | `P2P_VPN_ADVERTISE` | `""` | Comma-separated list of subnets to route |

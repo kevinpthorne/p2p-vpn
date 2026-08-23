@@ -554,7 +554,7 @@ func ReadFrame(r io.Reader, key []byte) ([]byte, error) {
 	return payload, err
 }
 
-func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID, relayMaxReservations, relayMaxReservationsPerIP, relayMaxReservationsPerASN, autorelayBackoff, autorelayBootDelay, autorelayMinCandidates int) (host.Host, *dht.IpfsDHT, error) {
+func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAddrs []string, port int, clusterID string, allowedPeers []peer.ID, relayMaxReservations, relayMaxReservationsPerIP, relayMaxReservationsPerASN, autorelayBackoff, autorelayBootDelay, autorelayMinCandidates int, extDNS string) (host.Host, *dht.IpfsDHT, error) {
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 	udpListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 
@@ -575,6 +575,26 @@ func MakeHost(ctx context.Context, mode string, privKey crypto.PrivKey, relayAdd
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(tcpListen, udpListen),
+	}
+
+	if extDNS != "" {
+		dnsTCPStr := fmt.Sprintf("/dns/%s/tcp/%d", extDNS, port)
+		dnsQUICStr := fmt.Sprintf("/dns/%s/udp/%d/quic-v1", extDNS, port)
+		
+		var extAddrs []multiaddr.Multiaddr
+		if ma, err := multiaddr.NewMultiaddr(dnsTCPStr); err == nil {
+			extAddrs = append(extAddrs, ma)
+		}
+		if ma, err := multiaddr.NewMultiaddr(dnsQUICStr); err == nil {
+			extAddrs = append(extAddrs, ma)
+		}
+		
+		if len(extAddrs) > 0 {
+			addrsFactory := func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+				return append(addrs, extAddrs...)
+			}
+			opts = append(opts, libp2p.AddrsFactory(addrsFactory))
+		}
 	}
 
 	if mode == "relay" {

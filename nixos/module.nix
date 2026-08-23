@@ -36,10 +36,16 @@ in {
       description = "The virtual TUN IP and subnet (e.g. 10.200.0.1/24) for endpoint mode.";
     };
 
-    relay = mkOption {
+    relays = mkOption {
+      type = types.coercedTo types.str (s: [s]) (types.listOf types.str);
+      default = [];
+      description = "The bootstrap relay multiaddr(s) for endpoint mode. Can be a string or a list of strings.";
+    };
+
+    extDns = mkOption {
       type = types.str;
       default = "";
-      description = "The bootstrap relay multiaddr for endpoint mode.";
+      description = "External DNS name to advertise in logs (e.g. relay.example.org).";
     };
 
     advertise = mkOption {
@@ -81,16 +87,16 @@ in {
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.mode == "endpoint" -> (cfg.tunIp != "" && cfg.relay != "");
-        message = "services.p2p-vpn: 'tunIp' and 'relay' must be set when using endpoint mode.";
+        assertion = cfg.mode == "endpoint" -> (cfg.tunIp != "" && cfg.relays != []);
+        message = "services.p2p-vpn: 'tunIp' and 'relays' must be set when using endpoint mode.";
       }
       {
         assertion = cfg.mode == "endpoint" -> cfg.dataKeyPath != null;
         message = "services.p2p-vpn: 'dataKeyPath' must be set when using endpoint mode.";
       }
       {
-        assertion = cfg.mode == "relay" -> (cfg.tunIp == "" && cfg.relay == "");
-        message = "services.p2p-vpn: 'tunIp' and 'relay' should not be set when using relay mode.";
+        assertion = cfg.mode == "relay" -> (cfg.tunIp == "" && cfg.relays == []);
+        message = "services.p2p-vpn: 'tunIp' and 'relays' should not be set when using relay mode.";
       }
     ];
 
@@ -126,7 +132,8 @@ in {
             "-port" (toString cfg.port)
           ] ++ optionals (cfg.dataKeyPath != null) [ "-datakey" cfg.dataKeyPath ]
             ++ optionals (cfg.tunIp != "") [ "-tun-ip" cfg.tunIp ]
-            ++ optionals (cfg.relay != "") [ "-relay" cfg.relay ]
+            ++ optionals (cfg.relays != []) [ "-relays" (concatStringsSep "," cfg.relays) ]
+            ++ optionals (cfg.extDns != "") [ "-ext-dns" cfg.extDns ]
             ++ optionals (cfg.advertise != "") [ "-advertise" cfg.advertise ]
             ++ optionals (cfg.caKey != null) [ "-ca-key" "/etc/p2p-vpn/ca.pub" ]
             ++ optionals (cfg.nodeSig != null) [ "-node-sig" "/etc/p2p-vpn/node.sig" ]

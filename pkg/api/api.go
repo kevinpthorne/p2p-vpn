@@ -49,6 +49,7 @@ type Profile struct {
 	NodeSigContent   string   `json:"node_sig_content"`
 	AllowedPeersPath string   `json:"allowed_peers_path"`
 	RelayAddrs                 []string `json:"relay_addrs"`
+	ExtDNS                     string   `json:"ext_dns"`
 	DisableIPAuth              bool     `json:"disable_ip_auth"`
 	RelayMaxReservations       int      `json:"relay_max_reservations"`
 	RelayMaxReservationsPerIP  int      `json:"relay_max_reservations_per_ip"`
@@ -1111,7 +1112,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 		}
 	}
 
-	h, dhtObj, err := vpn.MakeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers, p.RelayMaxReservations, p.RelayMaxReservationsPerIP, p.RelayMaxReservationsPerASN, p.AutoRelayBackoff, p.AutoRelayBootDelay, p.AutoRelayMinCandidates)
+	h, dhtObj, err := vpn.MakeHost(ctx, p.Mode, privKey, p.RelayAddrs, p.Port, p.ClusterID, allowedPeers, p.RelayMaxReservations, p.RelayMaxReservationsPerIP, p.RelayMaxReservationsPerASN, p.AutoRelayBackoff, p.AutoRelayBootDelay, p.AutoRelayMinCandidates, p.ExtDNS)
 	if err != nil {
 		log.Printf("❌ Failed to initialize libp2p host: %v", err)
 		CleanupActiveVPN()
@@ -1249,6 +1250,7 @@ func runVPNDaemon(ctx context.Context, p *Profile) {
 				for _, a := range h.Addrs() {
 					log.Printf("   %s/p2p/%s", a, h.ID())
 				}
+
 				select {
 				case <-ctx.Done():
 					return

@@ -22,8 +22,9 @@ dryRun: false
 
 # Mode-specific parameters
 # For endpoint mode:
-relayMultiaddr: ""
+relayMultiaddrs: "" # Can be a string or a list of strings
 tunIp: ""       # e.g., "10.200.0.1/24"
+extDns: ""      # e.g., "relay.example.org"
 advertise: ""   # e.g., "10.100.1.0/24"
 
 # Secret configurations

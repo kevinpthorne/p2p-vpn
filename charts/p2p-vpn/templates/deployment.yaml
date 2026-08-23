@@ -33,13 +33,21 @@ spec:
               value: {{ .Values.cluster | quote }}
             - name: P2P_VPN_DRY_RUN
               value: {{ .Values.dryRun | quote }}
-            {{- if .Values.relayMultiaddr }}
-            - name: P2P_VPN_RELAY
-              value: {{ .Values.relayMultiaddr | quote }}
+            {{- if .Values.relayMultiaddrs }}
+            - name: P2P_VPN_RELAYS
+              {{- if kindIs "slice" .Values.relayMultiaddrs }}
+              value: {{ join "," .Values.relayMultiaddrs | quote }}
+              {{- else }}
+              value: {{ .Values.relayMultiaddrs | quote }}
+              {{- end }}
             {{- end }}
             {{- if .Values.tunIp }}
             - name: P2P_VPN_TUN_IP
               value: {{ .Values.tunIp | quote }}
+            {{- end }}
+            {{- if .Values.extDns }}
+            - name: P2P_VPN_EXT_DNS
+              value: {{ .Values.extDns | quote }}
             {{- end }}
             {{- if .Values.advertise }}
             - name: P2P_VPN_ADVERTISE

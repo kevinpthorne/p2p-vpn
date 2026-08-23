@@ -35,10 +35,11 @@
       
       # --- Relay Settings (Ignore if endpoint) ---
       P2P_VPN_PORT = "4001";
+      # P2P_VPN_EXT_DNS = "myrelay.example.org";
       
       # --- Endpoint Settings (Ignore if relay) ---
       # P2P_VPN_TUN_IP = "10.200.0.1/24";
-      # P2P_VPN_RELAY = "/ip4/1.2.3.4/tcp/4001/p2p/Qm...";
+      # P2P_VPN_RELAYS = "/ip4/1.2.3.4/tcp/4001/p2p/Qm...";
       
       # --- Key & PKI Paths ---
       P2P_VPN_DATAKEY = "/etc/p2p-vpn/data.key";

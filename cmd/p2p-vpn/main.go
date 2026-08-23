@@ -58,10 +58,11 @@ func main() {
 	portFlag := flag.Int("port", 0, "Listening port (Default: 4001 for relay, 0/ephemeral for endpoint)")
 	identityPathFlag := flag.String("identity", getEnv("P2P_VPN_IDENTITY", ""), "Path to identity file (Defaults: identity-<mode>.key)")
 	clusterIDFlag := flag.String("cluster", getEnv("P2P_VPN_CLUSTER", "my-k8s-cluster"), "The cluster ID string for rendezvous")
-	relayAddrsFlag := flag.String("relay", getEnv("P2P_VPN_RELAY", ""), "Comma-separated multiaddrs of bootstrap relays")
+	relayAddrsFlag := flag.String("relays", getEnv("P2P_VPN_RELAYS", ""), "Comma-separated multiaddrs of bootstrap relays")
 	dataKeyPathFlag := flag.String("datakey", getEnv("P2P_VPN_DATAKEY", ""), "Path to hex-encoded 32-byte AES data key file")
 	tunIPFlag := flag.String("tun-ip", getEnv("P2P_VPN_TUN_IP", ""), "Virtual TUN interface IP/CIDR (e.g. 10.200.0.1/24)")
 	advertiseFlag := flag.String("advertise", getEnv("P2P_VPN_ADVERTISE", ""), "Comma-separated subnets to advertise (e.g. 10.100.1.0/24)")
+	extDNSFlag := flag.String("ext-dns", getEnv("P2P_VPN_EXT_DNS", ""), "External DNS name to advertise in logs (e.g. relay.example.org)")
 	dryRunFlag := flag.Bool("dry-run", getEnvBool("P2P_VPN_DRY_RUN", false), "Run with dry-run/mock TUN interface")
 	allowedPeersFlag := flag.String("allowed-peers", getEnv("P2P_VPN_ALLOWED_PEERS", ""), "Path to file containing allowed Peer IDs (one per line) for Connection Gater")
 	caKeyPathFlag := flag.String("ca-key", getEnv("P2P_VPN_CA_KEY", ""), "Path to the PEM-encoded CA public key file")
@@ -434,7 +435,7 @@ func main() {
 		}
 	}
 
-	h, dhtObj, err := vpn.MakeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers, *relayMaxResFlag, *relayMaxResPerIPFlag, *relayMaxResPerASNFlag, *autorelayBackoffFlag, *autorelayBootDelayFlag, *autorelayMinCandidatesFlag)
+	h, dhtObj, err := vpn.MakeHost(ctx, *modeFlag, privKey, relayAddrs, finalPort, *clusterIDFlag, allowedPeers, *relayMaxResFlag, *relayMaxResPerIPFlag, *relayMaxResPerASNFlag, *autorelayBackoffFlag, *autorelayBootDelayFlag, *autorelayMinCandidatesFlag, *extDNSFlag)
 	if err != nil {
 		log.Fatalf("❌ FATAL: Failed to initialize libp2p host: %v", err)
 	}
