@@ -17,7 +17,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = "1.0.4";
+        version = "1.1.0";
 
         # Define native package (for devShell and default binary of the host platform)
         p2p-vpn-native = (pkgs.buildGoModule.override { go = pkgs.go_1_25; }) {
